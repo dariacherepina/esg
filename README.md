@@ -207,6 +207,42 @@ $metrics = (Invoke-WebRequest http://localhost:8081/actuator/prometheus -UseBasi
 $metrics -split "`n" | Select-String '^jvm_memory_used_bytes.*area="heap"' | ForEach-Object { $_.Line }
 ```
 
+## Docker images
+
+Two variants per service, both built **from the repository root** (child POMs need the parent):
+
+```powershell
+docker build -f company-service/Dockerfile            -t company-service:single .
+docker build -f company-service/Dockerfile.multistage -t company-service:multi  .
+```
+
+| Variant | Contents | JVM flags |
+|---------|----------|-----------|
+| `Dockerfile` (single-stage) | Ubuntu + full JDK 21 + Maven + Maven repo + sources + JAR, runs as root | none (defaults) |
+| `Dockerfile.multistage` | Alpine + JRE 21 + JAR only, runs as user `app` | `JAVA_OPTS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=75"` |
+
+Measured for company-service (Docker 28, containerd image store):
+
+| | single | multi |
+|-|--------|-------|
+| Compressed size (what `docker pull` transfers) | 404 MB | 127 MB |
+| Unpacked size (sum of layers in `docker history`) | ~755 MB | ~272 MB |
+| `docker image ls` SIZE (compressed + unpacked) | 1.16 GB | 399 MB |
+| Max heap with `--memory=512m` | 128 MB (25 %) | 384 MB (75 %) |
+
+> **Measure size consistently.** With the containerd image store, `docker image ls` adds the
+> compressed and unpacked sizes together. Use the compressed size for pull-time comparisons:
+> `docker image inspect company-service:multi --format '{{.Size}}'`
+
+Run a container against the compose Postgres (inside Docker the DB host is `esg-postgres`):
+
+```powershell
+docker run --rm --network esg_default --memory=512m -p 18081:8081 `
+  -e DB_URL=jdbc:postgresql://esg-postgres:5432/company_db company-service:multi
+```
+
+Switch the JVM flags off for the experiment with `-e JAVA_OPTS=`.
+
 ## Seed data
 
 `company-service/src/main/resources/db/migration/V2__seed_companies.sql` inserts 20 fictional

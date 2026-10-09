@@ -441,9 +441,13 @@ $metrics -split "`n" | Select-String '^jvm_memory_max_bytes.*area="heap"' | ForE
 ```
 
 **Look for:** the `G1 Old Gen` max is roughly **¼ of your machine's RAM** (e.g. ~4.2 GB on a
-16 GB laptop). Without flags, the JVM sizes its heap from the *host's* memory. Inside a
-container with a 512 MB limit that would be far too big — exactly the problem
-`-XX:MaxRAMPercentage=75` fixes in the multi-stage image, and what you'll measure later.
+16 GB laptop). By default the JVM uses 25% of the memory it can see as max heap. Run directly
+on your laptop, it sees all of the host's RAM.
+
+Inside a container, a modern JVM (10+) sees the **container's** memory limit instead
+(`UseContainerSupport` is on by default). So with a 512 MB limit and no flags you get 25% =
+128 MB heap — safe, but most of the container's memory goes unused by the heap. 
+`-XX:MaxRAMPercentage=75` raises that to 384 MB. Lab 13 measures exactly this.
 
 Now call the API ten times and look at the request counter grow:
 
@@ -455,6 +459,39 @@ $metrics -split "`n" | Select-String '^http_server_requests_seconds_count.*compa
 
 **Look for:** `uri="/api/companies/{id}"` — the URI is the *template*, not `/api/companies/1`,
 so metrics don't explode into one series per id.
+
+### Lab 13 — The two Docker images
+
+Build both (from the repo root; the first build takes a few minutes):
+
+```powershell
+docker build -f company-service/Dockerfile -t company-service:single .
+docker build -f company-service/Dockerfile.multistage -t company-service:multi .
+docker image ls company-service
+docker history company-service:single
+docker history company-service:multi
+```
+
+**Look for:** in `docker history`, the single image contains a ~309 MB JDK layer plus a
+~190 MB layer of Maven downloads and build output. The multi image contains only Alpine, a
+~165 MB JRE and the ~60 MB JAR — the build stage is thrown away.
+
+Run the multi image with a memory limit, connected to the compose Postgres:
+
+```powershell
+docker run --rm -d --name cs --network esg_default --memory=512m -p 18081:8081 `
+  -e DB_URL=jdbc:postgresql://esg-postgres:5432/company_db company-service:multi
+docker exec cs sh -c 'java $JAVA_OPTS -XX:+PrintFlagsFinal -version 2>/dev/null | grep -E " MaxHeapSize | MaxRAMPercentage "'
+docker exec cs whoami
+docker rm -f cs
+```
+
+Note: inside the container the database host is `esg-postgres` (the container name on the
+compose network `esg_default`), not `localhost` — `localhost` inside a container is the
+container itself.
+
+**Look for:** `MaxHeapSize` ≈ 384 MB and `MaxRAMPercentage = 75`; user `app`, not `root`.
+Repeat with `-e JAVA_OPTS=` added to `docker run` (flags off) → `MaxHeapSize` ≈ 128 MB.
 
 ---
 

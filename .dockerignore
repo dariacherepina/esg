@@ -1,0 +1,10 @@
+# Build context is the repo root (child POMs need the parent POM).
+# Keep the context small and builds reproducible: only sources and POMs go in.
+**/target/
+.git/
+.idea/
+.vscode/
+*.iml
+*.log
+docs/
+docker/
