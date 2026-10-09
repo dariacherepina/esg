@@ -12,6 +12,7 @@ esg/
 ├── docker-compose.yml           # local PostgreSQL for development
 ├── docker/postgres/init/        # SQL run once on first Postgres start (creates databases)
 └── company-service/             # port 8081 — company profiles + raw ESG data
+    └── src/main/resources/db/migration/   # Flyway: schema (V1) and 20 seed companies (V2)
 ```
 
 ## Prerequisites
@@ -98,6 +99,47 @@ The startup log should contain no `WARN` lines. On PowerShell you can filter for
 ```
 java -jar company-service/target/company-service-0.0.1-SNAPSHOT.jar | Select-String "WARN"
 ```
+
+### Check 5 — schema and seed data were created by Flyway
+
+On the **first** start against an empty database the log shows:
+
+```
+Successfully applied 2 migrations to schema "public", now at version v2
+```
+
+On every later start: `Schema "public" is up to date. No migration necessary.`
+
+Count the seeded companies (expected: 5 per sector, 20 in total):
+
+```
+docker exec -it esg-postgres psql -U esg -d company_db -c "select sector, count(*) from companies group by sector"
+```
+
+## Seed data
+
+`company-service/src/main/resources/db/migration/V2__seed_companies.sql` inserts 20 fictional
+companies — 5 per sector, spread over the rating bands (5 Excellent, 5 Good, 5 Fair, 5 Poor).
+
+| Field                  | Unit                              | Range  | Better |
+|------------------------|-----------------------------------|--------|--------|
+| `co2_emissions`        | tonnes CO₂ per EUR 1M revenue     | 0–1000 | lower  |
+| `renewable_energy_pct` | % of energy from renewables       | 0–100  | higher |
+| `water_consumption`    | m³ per EUR 1M revenue             | 0–5000 | lower  |
+| `board_diversity_pct`  | % underrepresented board members  | 0–100  | higher |
+| `corruption_incidents` | confirmed cases in last 3 years   | 0–10   | lower  |
+| `transparency_score`   | disclosure quality rating         | 0–100  | higher |
+
+**Before every experiment run**, reset to the known state so ids 1–20 and all values are
+identical:
+
+```
+docker compose down -v
+docker compose up -d
+```
+
+Never edit a migration that has already been applied — Flyway stores a checksum and refuses
+to start if it changes. Add a new `V3__...sql` file instead.
 
 ## Configuration
 
