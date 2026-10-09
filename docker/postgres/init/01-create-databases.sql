@@ -1,2 +1,3 @@
 CREATE DATABASE company_db;
--- score_db and portfolio_db get added here in later steps
+CREATE DATABASE score_db;
+-- portfolio_db gets added here in a later step

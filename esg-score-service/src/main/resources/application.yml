@@ -1,0 +1,38 @@
+server:
+  port: 8082
+
+spring:
+  application:
+    name: esg-score-service
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/score_db}
+    username: ${DB_USERNAME:esg}
+    password: ${DB_PASSWORD:esg}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:esg}
+    password: ${RABBITMQ_PASSWORD:esg}
+
+company-service:
+  url: ${COMPANY_SERVICE_URL:http://localhost:8081}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
