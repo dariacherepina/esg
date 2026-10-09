@@ -162,11 +162,33 @@ applied file was modified.
 
 ### ⑨ Tests
 
-| Test class | Type | What's real | What's fake | Speed |
-|------------|------|-------------|-------------|-------|
-| `CompanyServiceTest` | unit | the service | repository (Mockito `@Mock`) | ~1 s |
-| `CompanyControllerTest` | web slice | controller, JSON, validation, error handler | service (`@MockitoBean`) | ~10 s |
-| *(Step 7)* integration | full | everything incl. Postgres | nothing | ~20 s |
+| Test class | Type | What's real | What's fake | Speed | Run by |
+|------------|------|-------------|-------------|-------|--------|
+| `CompanyServiceTest` | unit | the service | repository (Mockito `@Mock`) | ~1 s | `mvn test` |
+| `CompanyControllerTest` | web slice | controller, JSON, validation, error handler | service (`@MockitoBean`) | ~10 s | `mvn test` |
+| `CompanyApiIT` | integration | everything: HTTP server, Flyway, Hibernate, Postgres | nothing | ~40 s | `mvn verify` |
+
+**The test pyramid:** many fast tests with fakes at the bottom, a few slow realistic ones at the
+top. Mocks prove the *logic* is right; only `CompanyApiIT` proves the pieces actually *fit*
+(SQL is valid, entity matches table, constraints exist).
+
+**How `CompanyApiIT` works:**
+
+* `@Container static PostgreSQLContainer` — Testcontainers starts a fresh `postgres:16-alpine`
+  container on a **random free port** before the tests and removes it afterwards (the extra
+  `ryuk` container is Testcontainers' janitor that guarantees cleanup even if the JVM crashes).
+* `@ServiceConnection` — Spring Boot reads the container's random URL/user/password and
+  configures the datasource with them, overriding `application.yml`.
+* `@SpringBootTest(webEnvironment = RANDOM_PORT)` — starts the **real** app with a real Tomcat;
+  `TestRestTemplate` sends real HTTP requests to it.
+* `@BeforeEach flyway.clean(); flyway.migrate();` — wipes and re-seeds the database before
+  every test, so each test sees ids 1–20 regardless of what other tests created. `clean` is
+  forbidden by default (it deletes everything!) and only enabled in `application-it.yml`,
+  which is loaded only under the `it` profile.
+
+**Why `*IT.java` is separate:** the Maven **Surefire** plugin runs `*Test.java` in the `test`
+phase; the **Failsafe** plugin runs `*IT.java` in the `integration-test` phase, which comes
+after `package`. So `mvn test` stays fast and Docker-free, and `mvn verify` runs everything.
 
 ---
 
@@ -378,6 +400,17 @@ Run the tests again.
 
 **Result:** `createRejectsDuplicateName` fails and tells you exactly which rule broke.
 That's the purpose of the tests — they pin down every rule. **Undo the change.**
+
+Then run the integration tests and watch Docker while they run:
+
+```powershell
+mvn -pl company-service -am verify      # terminal 1
+docker ps                               # terminal 2, while tests run
+```
+
+**Look for:** two extra containers (`postgres:16-alpine` on a random port and
+`testcontainers/ryuk`) that appear during the run and disappear afterwards. Your
+`esg-postgres` container is untouched.
 
 ### Lab 11 — Configuration via environment variables
 

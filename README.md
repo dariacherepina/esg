@@ -119,6 +119,16 @@ Count the seeded companies (expected: 5 per sector, 20 in total):
 docker exec -it esg-postgres psql -U esg -d company_db -c "select sector, count(*) from companies group by sector"
 ```
 
+## Running the tests
+
+| Command                                  | Runs                                        | Needs Docker |
+|------------------------------------------|---------------------------------------------|--------------|
+| `mvn -pl company-service -am test`       | unit + web-slice tests (`*Test.java`)       | no           |
+| `mvn -pl company-service -am verify`     | the above **plus** integration tests (`*IT.java`) | yes    |
+
+Integration tests start their own throwaway Postgres container via Testcontainers — they do
+**not** use (or touch) the docker-compose database, so you can run them while the app is running.
+
 ## company-service REST API
 
 Base URL: `http://localhost:8081/api/companies`
