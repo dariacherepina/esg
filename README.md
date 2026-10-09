@@ -116,6 +116,56 @@ Count the seeded companies (expected: 5 per sector, 20 in total):
 docker exec -it esg-postgres psql -U esg -d company_db -c "select sector, count(*) from companies group by sector"
 ```
 
+## company-service REST API
+
+Base URL: `http://localhost:8081/api/companies`
+
+| Method   | Path                             | Success                   | Errors        |
+|----------|----------------------------------|---------------------------|---------------|
+| `GET`    | `/api/companies`                 | 200 + list (ordered by id)| —             |
+| `GET`    | `/api/companies?sector=ENERGY`   | 200 + filtered list       | 400           |
+| `GET`    | `/api/companies/{id}`            | 200                       | 404           |
+| `POST`   | `/api/companies`                 | 201 + `Location` header   | 400, 409      |
+| `PUT`    | `/api/companies/{id}`            | 200 (replaces all fields) | 400, 404, 409 |
+| `DELETE` | `/api/companies/{id}`            | 204                       | 404           |
+
+Errors are returned as `application/problem+json` (RFC 9457). Validation errors list the
+offending fields under `errors`:
+
+```json
+{"title":"Bad Request","status":400,"detail":"Validation failed",
+ "errors":{"renewableEnergyPct":"must be less than or equal to 100"}}
+```
+
+### Trying it out (PowerShell)
+
+> In Windows PowerShell 5.1, `curl` is an alias for `Invoke-WebRequest` and does not accept
+> curl options. Use `Invoke-RestMethod` as below, or call `curl.exe` explicitly.
+
+```powershell
+$u = "http://localhost:8081/api/companies"
+
+# list all / filter by sector / get one
+Invoke-RestMethod $u | Format-Table id, name, sector
+Invoke-RestMethod "${u}?sector=FINANCE" | Format-Table id, name   # ${u}: "$u?" would be read as a variable named "u?"
+Invoke-RestMethod "$u/6"
+
+# create
+$body = @{
+  name = "Test Co"; sector = "FINANCE"; co2Emissions = 10; renewableEnergyPct = 50
+  waterConsumption = 100; boardDiversityPct = 30; corruptionIncidents = 0; transparencyScore = 70
+} | ConvertTo-Json
+$created = Invoke-RestMethod $u -Method Post -ContentType "application/json" -Body $body
+$created.id
+
+# update (PUT replaces all fields) and delete
+Invoke-RestMethod "$u/$($created.id)" -Method Put -ContentType "application/json" -Body $body
+Invoke-RestMethod "$u/$($created.id)" -Method Delete
+```
+
+Error responses make `Invoke-RestMethod` throw; the status code is shown in the red error
+text. To see the body of an error, use `curl.exe -s http://localhost:8081/api/companies/999`.
+
 ## Seed data
 
 `company-service/src/main/resources/db/migration/V2__seed_companies.sql` inserts 20 fictional
