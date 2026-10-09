@@ -12,3 +12,23 @@ spring:
     open-in-view: false
     hibernate:
       ddl-auto: validate
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      # /actuator/health/liveness and /readiness — used by Kubernetes probes.
+      # Enabled automatically on Kubernetes; switched on here so they also work locally.
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      # Every metric carries application="company-service" so Grafana can tell the services apart
+      application: ${spring.application.name}
+    distribution:
+      # Export latency buckets so Prometheus can compute p95/p99 response times under load
+      percentiles-histogram:
+        http.server.requests: true

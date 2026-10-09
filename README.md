@@ -179,6 +179,34 @@ Invoke-RestMethod "$u/$($created.id)" -Method Delete
 Error responses make `Invoke-RestMethod` throw; the status code is shown in the red error
 text. To see the body of an error, use `curl.exe -s http://localhost:8081/api/companies/999`.
 
+## Health and metrics (Actuator)
+
+| Endpoint                       | Purpose                                              |
+|--------------------------------|------------------------------------------------------|
+| `/actuator/health`             | overall status (`{"status":"UP"}`)                   |
+| `/actuator/health/liveness`    | Kubernetes liveness probe — "is the JVM alive?"      |
+| `/actuator/health/readiness`   | Kubernetes readiness probe — "can it take traffic?"  |
+| `/actuator/prometheus`         | all metrics in Prometheus text format                |
+
+Every metric carries the label `application="company-service"`. Metrics relevant to the
+experiments:
+
+| Metric                                  | Used for                         |
+|-----------------------------------------|----------------------------------|
+| `jvm_memory_used_bytes{area="heap"}`    | JVM heap behaviour per image variant |
+| `jvm_memory_max_bytes{area="heap"}`     | effect of `-XX:MaxRAMPercentage` |
+| `process_cpu_usage`                     | CPU per pod                      |
+| `http_server_requests_seconds_*`        | request rate and latency (p95/p99) under load |
+| `hikaricp_connections_active`           | DB connection pool usage         |
+| `application_ready_time_seconds`        | startup time                     |
+
+```powershell
+Invoke-RestMethod http://localhost:8081/actuator/health/readiness
+
+$metrics = (Invoke-WebRequest http://localhost:8081/actuator/prometheus -UseBasicParsing).Content
+$metrics -split "`n" | Select-String '^jvm_memory_used_bytes.*area="heap"' | ForEach-Object { $_.Line }
+```
+
 ## Seed data
 
 `company-service/src/main/resources/db/migration/V2__seed_companies.sql` inserts 20 fictional

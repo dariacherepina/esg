@@ -8,6 +8,7 @@ import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.actuate.observability.AutoConfigureObservability;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
@@ -36,6 +37,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 @Testcontainers
 @ActiveProfiles("it")
+@AutoConfigureObservability(tracing = false) // Spring Boot disables metrics export in tests unless asked
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class CompanyApiIT {
 
@@ -154,6 +156,29 @@ class CompanyApiIT {
                 """))
                 .isInstanceOf(DataIntegrityViolationException.class)
                 .hasMessageContaining("companies_renewable_energy_pct_check");
+    }
+
+    @Test
+    void healthAndKubernetesProbesReportUp() {
+        for (String path : new String[] {"/actuator/health", "/actuator/health/liveness", "/actuator/health/readiness"}) {
+            ResponseEntity<String> response = rest.getForEntity(path, String.class);
+            assertThat(response.getStatusCode()).as(path).isEqualTo(HttpStatus.OK);
+            assertThat(response.getBody()).as(path).contains("\"status\":\"UP\"");
+        }
+    }
+
+    @Test
+    void prometheusEndpointExposesMetricsNeededForExperiments() {
+        rest.getForObject("/api/companies/1", String.class); // produce at least one HTTP metric
+
+        String metrics = rest.getForObject("/actuator/prometheus", String.class);
+
+        assertThat(metrics)
+                .contains("jvm_memory_used_bytes{")            // JVM heap experiment
+                .contains("process_cpu_usage{")                // CPU
+                .contains("hikaricp_connections_active{")      // DB connection pool
+                .contains("http_server_requests_seconds_bucket{") // latency histogram
+                .contains("application=\"company-service\"");  // per-service label for Grafana
     }
 
     @Test

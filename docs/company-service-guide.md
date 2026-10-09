@@ -106,6 +106,8 @@ is empty. The `healthcheck` lets Docker report when Postgres actually accepts co
 | `spring-boot-starter-validation`   | `@NotNull`, `@DecimalMax`, ... and the engine to check them |
 | `flyway-core` + `flyway-database-postgresql` | Runs versioned SQL migrations at startup     |
 | `postgresql` (runtime)             | JDBC driver — how Java talks to Postgres                |
+| `spring-boot-starter-actuator`     | `/actuator/health` (+ Kubernetes liveness/readiness probes) |
+| `micrometer-registry-prometheus` (runtime) | `/actuator/prometheus` — metrics in Prometheus format |
 | `spring-boot-starter-test` (test)  | JUnit 5, Mockito, AssertJ, MockMvc                      |
 
 No versions are written: the parent POM decides them.
@@ -422,6 +424,37 @@ Remove-Item Env:DB_PASSWORD
 
 **Result:** `password authentication failed for user "esg"`. The JAR is unchanged — only the
 environment differs. Kubernetes will use exactly this mechanism.
+
+---
+
+### Lab 12 — Health probes and metrics
+
+With the app running:
+
+```powershell
+Invoke-RestMethod http://localhost:8081/actuator/health
+Invoke-RestMethod http://localhost:8081/actuator/health/liveness
+Invoke-RestMethod http://localhost:8081/actuator/health/readiness
+
+$metrics = (Invoke-WebRequest http://localhost:8081/actuator/prometheus -UseBasicParsing).Content
+$metrics -split "`n" | Select-String '^jvm_memory_max_bytes.*area="heap"' | ForEach-Object { $_.Line }
+```
+
+**Look for:** the `G1 Old Gen` max is roughly **¼ of your machine's RAM** (e.g. ~4.2 GB on a
+16 GB laptop). Without flags, the JVM sizes its heap from the *host's* memory. Inside a
+container with a 512 MB limit that would be far too big — exactly the problem
+`-XX:MaxRAMPercentage=75` fixes in the multi-stage image, and what you'll measure later.
+
+Now call the API ten times and look at the request counter grow:
+
+```powershell
+1..10 | ForEach-Object { Invoke-RestMethod http://localhost:8081/api/companies/1 | Out-Null }
+$metrics = (Invoke-WebRequest http://localhost:8081/actuator/prometheus -UseBasicParsing).Content
+$metrics -split "`n" | Select-String '^http_server_requests_seconds_count.*companies' | ForEach-Object { $_.Line }
+```
+
+**Look for:** `uri="/api/companies/{id}"` — the URI is the *template*, not `/api/companies/1`,
+so metrics don't explode into one series per id.
 
 ---
 
