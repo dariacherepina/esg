@@ -11,7 +11,9 @@ WORKDIR /build
 COPY pom.xml .
 COPY company-service ./company-service
 
-RUN mvn -B -q -pl company-service -am package -DskipTests
+# -f builds the module via its own POM; the parent is read only for inheritance, so the other
+# modules listed in the root POM don't need to be in the build context.
+RUN mvn -B -q -f company-service/pom.xml package -DskipTests
 
 EXPOSE 8081
 ENTRYPOINT ["java", "-jar", "/build/company-service/target/company-service-0.0.1-SNAPSHOT.jar"]

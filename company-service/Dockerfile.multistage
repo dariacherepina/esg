@@ -14,12 +14,14 @@ WORKDIR /build
 
 # POMs first: this layer (and the dependency download) is reused by Docker
 # as long as no pom.xml changes, even when the source code changes.
+# -f builds the module via its own POM; the parent is read only for inheritance, so the other
+# modules listed in the root POM don't need to be in the build context.
 COPY pom.xml .
 COPY company-service/pom.xml ./company-service/
-RUN mvn -B -q -pl company-service -am dependency:go-offline
+RUN mvn -B -q -f company-service/pom.xml dependency:go-offline
 
 COPY company-service/src ./company-service/src
-RUN mvn -B -q -pl company-service -am package -DskipTests
+RUN mvn -B -q -f company-service/pom.xml package -DskipTests
 
 # ---------- Stage 2: runtime ----------
 FROM eclipse-temurin:21-jre-alpine
@@ -32,7 +34,7 @@ WORKDIR /app
 COPY --from=build /build/company-service/target/company-service-0.0.1-SNAPSHOT.jar app.jar
 
 # UseContainerSupport: read CPU/memory limits from the container (default since JDK 10, set explicitly).
-# MaxRAMPercentage=75: max heap = 75% of the container memory limit instead of 25% of host RAM.
+# MaxRAMPercentage=75: max heap = 75% of the container memory limit instead of the default 25%.
 ENV JAVA_OPTS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=75"
 
 EXPOSE 8081

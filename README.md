@@ -4,18 +4,40 @@ A deliberately simplified, reproducible microservice platform used as a controll
 environment for measuring resource efficiency (Kubernetes resource limits, container image
 optimisation, CI pipeline caching).
 
-**New here?** Read [docs/company-service-guide.md](docs/company-service-guide.md) — architecture,
-a file-by-file tour, request flow, and hands-on labs.
+**Guides** — architecture, file-by-file tours, request flows and hands-on labs:
+- [docs/company-service-guide.md](docs/company-service-guide.md)
+- [docs/esg-score-service-guide.md](docs/esg-score-service-guide.md)
+
+## Services
+
+| Service | Port | Database | Role | Status |
+|---------|------|----------|------|--------|
+| company-service | 8081 | `company_db` | company profiles + raw ESG data, CRUD, 20 seed companies | ✅ |
+| esg-score-service | 8082 | `score_db` | fetches raw data via REST, calculates scores, publishes `score.updated` | ✅ |
+| portfolio-service | 8083 | `portfolio_db` | portfolios, consumes `score.updated` | planned |
+| report-service | 8084 | — (in memory) | sustainability reports, consumes `score.updated` | planned |
+
+```
+company-service ◄── REST ── esg-score-service ── score.updated ──► RabbitMQ exchange "esg.events"
+                                                                     ├──► portfolio-service (planned)
+                                                                     └──► report-service    (planned)
+```
 
 ## Repository layout
 
 ```
 esg/
 ├── pom.xml                      # Maven parent POM (Spring Boot 3.5, Java 21)
-├── docker-compose.yml           # local PostgreSQL for development
+├── docker-compose.yml           # local PostgreSQL + RabbitMQ for development
 ├── docker/postgres/init/        # SQL run once on first Postgres start (creates databases)
-└── company-service/             # port 8081 — company profiles + raw ESG data
-    └── src/main/resources/db/migration/   # Flyway: schema (V1) and 20 seed companies (V2)
+├── company-service/             # port 8081
+│   ├── Dockerfile               # single-stage variant
+│   ├── Dockerfile.multistage    # multi-stage variant
+│   └── src/main/resources/db/migration/   # Flyway: schema (V1) and 20 seed companies (V2)
+├── esg-score-service/           # port 8082
+│   ├── Dockerfile, Dockerfile.multistage
+│   └── src/main/java/com/esg/score/scoring/   # pure-Java scoring formula
+└── docs/                        # guides
 ```
 
 ## Prerequisites
@@ -28,106 +50,90 @@ esg/
 
 All commands are run from the repository root.
 
-### 1. Start PostgreSQL
+```powershell
+docker compose up -d                                          # Postgres + RabbitMQ
+mvn -pl company-service,esg-score-service -am package -DskipTests
 
-```
-docker compose up -d
-```
-
-### 2. Build and start company-service
-
-```
-mvn -pl company-service -am package
+# one terminal per service
 java -jar company-service/target/company-service-0.0.1-SNAPSHOT.jar
+java -jar esg-score-service/target/esg-score-service-0.0.1-SNAPSHOT.jar
 ```
 
-Stop the service with `Ctrl+C`.
+Stop a service with `Ctrl+C`. RabbitMQ's management UI: <http://localhost:15672> (`esg` / `esg`).
 
 ## Verifying the setup
 
-### Check 1 — Postgres container is healthy
+### Check 1 — infrastructure is healthy
 
 ```
 docker compose ps
 ```
 
-The `STATUS` column should read `Up ... (healthy)`. Right after starting it may show
-`(health: starting)` for a few seconds — run the command again.
+Both `esg-postgres` and `esg-rabbitmq` should read `Up ... (healthy)`. Right after starting it
+may show `(health: starting)` for a few seconds — run the command again.
 
 If you see `error during connect ... dockerDesktopLinuxEngine`, Docker Desktop is not running.
 
-### Check 2 — `company_db` exists
+### Check 2 — the databases exist
 
 ```
 docker exec -it esg-postgres psql -U esg -c "\l"
 ```
 
-This runs the `psql` client inside the container and lists all databases.
-`company_db` must appear in the `Name` column.
-
-If it is missing, the init script did not run (it only runs on an **empty** volume).
-Reset the volume and start again:
+`company_db` and `score_db` must appear in the `Name` column. If one is missing, the init
+script did not run (it only runs on an **empty** volume). Reset the volume:
 
 ```
 docker compose down -v
 docker compose up -d
 ```
 
-### Check 3 — the app connects to the database
+### Check 3 — the services connect and start
 
-Start the app (see above) and watch the log output for:
-
-```
-HikariPool-1 - Start completed.
-```
-
-HikariCP is the connection pool; this line means a real connection to Postgres was opened.
-If the database is unreachable, you will instead see `Connection refused` and
-`APPLICATION FAILED TO START`.
-
-### Check 4 — the app is running on port 8081
-
-The log should end with:
+Each service's log should contain, in this order:
 
 ```
-Tomcat started on port 8081 (http) with context path '/'
-Started CompanyServiceApplication in X seconds
+HikariPool-1 - Start completed.                                 # connected to Postgres
+Successfully applied N migrations  /  Schema "public" is up to date   # Flyway
+Tomcat started on port 808X (http)
+Started ...Application in X seconds
 ```
 
-Then open <http://localhost:8081> in a browser. A **Whitelabel Error Page (404)** is
-expected — the server is running, there are just no endpoints yet.
+If the database is unreachable you will instead see `Connection refused` and
+`Application run failed`. The startup log should contain no `WARN` lines.
 
-The startup log should contain no `WARN` lines. On PowerShell you can filter for them:
-
-```
-java -jar company-service/target/company-service-0.0.1-SNAPSHOT.jar | Select-String "WARN"
-```
-
-### Check 5 — schema and seed data were created by Flyway
-
-On the **first** start against an empty database the log shows:
-
-```
-Successfully applied 2 migrations to schema "public", now at version v2
-```
-
-On every later start: `Schema "public" is up to date. No migration necessary.`
-
-Count the seeded companies (expected: 5 per sector, 20 in total):
+### Check 4 — company-service has its seed data
 
 ```
 docker exec -it esg-postgres psql -U esg -d company_db -c "select sector, count(*) from companies group by sector"
 ```
 
+Expected: 5 per sector, 20 in total.
+
+### Check 5 — scores are calculated and published
+
+```powershell
+Invoke-RestMethod http://localhost:8082/api/scores -Method Post | Format-Table companyId, companyName, total
+```
+
+20 rows; Voltara Renewables (id 6) = 92.6. In the RabbitMQ UI, exchange `esg.events` shows
+a spike in its message rate.
+
 ## Running the tests
 
-| Command                                  | Runs                                        | Needs Docker |
-|------------------------------------------|---------------------------------------------|--------------|
-| `mvn -pl company-service -am test`       | unit + web-slice tests (`*Test.java`)       | no           |
-| `mvn -pl company-service -am verify`     | the above **plus** integration tests (`*IT.java`) | yes    |
+| Command | Runs | Needs Docker |
+|---------|------|--------------|
+| `mvn -pl <service> -am test` | unit + web-slice tests (`*Test.java`) | no |
+| `mvn -pl <service> -am verify` | the above **plus** integration tests (`*IT.java`) | yes |
+| `mvn verify` | everything, all services | yes |
 
-Integration tests start their own throwaway Postgres container via Testcontainers — they do
-**not** use (or touch) the docker-compose database, so you can run them while the app is running.
+| Service | `test` | `verify` adds |
+|---------|--------|---------------|
+| company-service | 25 | 9 (Postgres) |
+| esg-score-service | 44 | 4 (Postgres + RabbitMQ) |
+
+Integration tests start their own throwaway containers via Testcontainers — they do **not**
+use (or touch) the docker-compose infrastructure, so they can run while the apps are running.
 
 ## company-service REST API
 
@@ -179,7 +185,56 @@ Invoke-RestMethod "$u/$($created.id)" -Method Delete
 Error responses make `Invoke-RestMethod` throw; the status code is shown in the red error
 text. To see the body of an error, use `curl.exe -s http://localhost:8081/api/companies/999`.
 
+## esg-score-service REST API
+
+Base URL: `http://localhost:8082/api/scores`
+
+| Method | Path | Effect | Success | Errors |
+|--------|------|--------|---------|--------|
+| `POST` | `/api/scores/{companyId}` | fetch → calculate → store → publish `score.updated` | 200 | 404, 503 |
+| `POST` | `/api/scores` | the same for **all** companies (one event each) | 200 + list | 503 |
+| `GET`  | `/api/scores` | stored scores, ordered by company id | 200 | — |
+| `GET`  | `/api/scores/{companyId}` | stored score | 200 | 404 (not calculated yet) |
+
+503 means a dependency is down: company-service (nothing stored) or RabbitMQ (score stored,
+event not published).
+
+```powershell
+Invoke-RestMethod http://localhost:8082/api/scores/6 -Method Post
+```
+
+```json
+{"companyId":6,"companyName":"Voltara Renewables","environmental":96.0,"social":92.0,
+ "governance":88.0,"total":92.6,"calculatedAt":"2026-10-09T13:20:26.956Z"}
+```
+
+### Scoring formula
+
+Each raw value is normalised to 0–100 on its fixed range (inverted where lower is better),
+then averaged per pillar and weighted:
+
+```
+E = avg(100 − co2/10, renewable%, 100 − water/50)
+S = avg(min(diversity% × 2, 100), 100 − incidents × 10)
+G = transparency
+Total = E × 0.40 + S × 0.35 + G × 0.25          (all rounded to 2 decimals)
+```
+
+### Event `score.updated`
+
+| | |
+|-|-|
+| Exchange | `esg.events` (topic, durable) |
+| Routing key | `score.updated` |
+| Header | `__TypeId__: scoreUpdated` |
+| Payload | `{"companyId":6,"companyName":"Voltara Renewables","totalScore":92.6,"calculatedAt":"2026-10-09T13:21:35.243Z"}` |
+
+Consumers declare their **own** queue and bind it to `score.updated` — every bound queue
+receives every event (fan-out).
+
 ## Health and metrics (Actuator)
+
+Both services expose:
 
 | Endpoint                       | Purpose                                              |
 |--------------------------------|------------------------------------------------------|
@@ -188,7 +243,7 @@ text. To see the body of an error, use `curl.exe -s http://localhost:8081/api/co
 | `/actuator/health/readiness`   | Kubernetes readiness probe — "can it take traffic?"  |
 | `/actuator/prometheus`         | all metrics in Prometheus text format                |
 
-Every metric carries the label `application="company-service"`. Metrics relevant to the
+Every metric carries the label `application="<service name>"`. Metrics relevant to the
 experiments:
 
 | Metric                                  | Used for                         |
@@ -197,6 +252,8 @@ experiments:
 | `jvm_memory_max_bytes{area="heap"}`     | effect of `-XX:MaxRAMPercentage` |
 | `process_cpu_usage`                     | CPU per pod                      |
 | `http_server_requests_seconds_*`        | request rate and latency (p95/p99) under load |
+| `http_client_requests_seconds_*`        | esg-score-service → company-service calls |
+| `esg_scores_calculated_total`           | score calculations (esg-score-service) |
 | `hikaricp_connections_active`           | DB connection pool usage         |
 | `application_ready_time_seconds`        | startup time                     |
 
@@ -209,36 +266,47 @@ $metrics -split "`n" | Select-String '^jvm_memory_used_bytes.*area="heap"' | For
 
 ## Docker images
 
-Two variants per service, both built **from the repository root** (child POMs need the parent):
+Two variants per service, both built **from the repository root**:
 
 ```powershell
-docker build -f company-service/Dockerfile            -t company-service:single .
-docker build -f company-service/Dockerfile.multistage -t company-service:multi  .
+docker build -f company-service/Dockerfile              -t company-service:single   .
+docker build -f company-service/Dockerfile.multistage   -t company-service:multi    .
+docker build -f esg-score-service/Dockerfile            -t esg-score-service:single .
+docker build -f esg-score-service/Dockerfile.multistage -t esg-score-service:multi  .
 ```
+
+Inside the Dockerfiles each module is built with `mvn -f <service>/pom.xml`: the parent POM
+is used for inheritance only, so the other modules don't need to be in the build context.
 
 | Variant | Contents | JVM flags |
 |---------|----------|-----------|
 | `Dockerfile` (single-stage) | Ubuntu + full JDK 21 + Maven + Maven repo + sources + JAR, runs as root | none (defaults) |
 | `Dockerfile.multistage` | Alpine + JRE 21 + JAR only, runs as user `app` | `JAVA_OPTS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=75"` |
 
-Measured for company-service (Docker 28, containerd image store):
+Measured (Docker 28, containerd image store):
 
-| | single | multi |
-|-|--------|-------|
-| Compressed size (what `docker pull` transfers) | 404 MB | 127 MB |
-| Unpacked size (sum of layers in `docker history`) | ~755 MB | ~272 MB |
-| `docker image ls` SIZE (compressed + unpacked) | 1.16 GB | 399 MB |
-| Max heap with `--memory=512m` | 128 MB (25 %) | 384 MB (75 %) |
+| | company single | company multi | score single | score multi |
+|-|----------------|---------------|--------------|-------------|
+| Compressed (what `docker pull` transfers) | 404 MB | 127 MB | 406 MB | 128 MB |
+| Unpacked (sum of layers in `docker history`) | ~755 MB | ~272 MB | ~757 MB | ~273 MB |
+| Max heap with `--memory=512m` | 128 MB (25 %) | 384 MB (75 %) | 128 MB | 384 MB |
 
 > **Measure size consistently.** With the containerd image store, `docker image ls` adds the
-> compressed and unpacked sizes together. Use the compressed size for pull-time comparisons:
-> `docker image inspect company-service:multi --format '{{.Size}}'`
+> compressed and unpacked sizes together (e.g. 1.16 GB / 399 MB). Use the compressed size
+> for pull-time comparisons: `docker image inspect company-service:multi --format '{{.Size}}'`
 
-Run a container against the compose Postgres (inside Docker the DB host is `esg-postgres`):
+Run the services as containers against the compose infrastructure. Inside Docker, other
+containers are reached by **container name**, not `localhost`:
 
 ```powershell
-docker run --rm --network esg_default --memory=512m -p 18081:8081 `
+docker run -d --name cs --network esg_default --memory=512m -p 18081:8081 `
   -e DB_URL=jdbc:postgresql://esg-postgres:5432/company_db company-service:multi
+
+docker run -d --name ss --network esg_default --memory=512m -p 18082:8082 `
+  -e DB_URL=jdbc:postgresql://esg-postgres:5432/score_db `
+  -e RABBITMQ_HOST=esg-rabbitmq -e COMPANY_SERVICE_URL=http://cs:8081 esg-score-service:multi
+
+docker rm -f cs ss      # stop and remove
 ```
 
 Switch the JVM flags off for the experiment with `-e JAVA_OPTS=`.
@@ -257,8 +325,8 @@ companies — 5 per sector, spread over the rating bands (5 Excellent, 5 Good, 5
 | `corruption_incidents` | confirmed cases in last 3 years   | 0–10   | lower  |
 | `transparency_score`   | disclosure quality rating         | 0–100  | higher |
 
-**Before every experiment run**, reset to the known state so ids 1–20 and all values are
-identical:
+**Before every experiment run**, reset to the known state (company ids 1–20, no scores,
+empty queues):
 
 ```
 docker compose down -v
@@ -270,27 +338,25 @@ to start if it changes. Add a new `V3__...sql` file instead.
 
 ## Configuration
 
-company-service reads its database settings from environment variables, falling back to
-local defaults:
+Every setting can be overridden with an environment variable; the defaults work locally.
 
-| Variable      | Default                                         |
-|---------------|-------------------------------------------------|
-| `DB_URL`      | `jdbc:postgresql://localhost:5432/company_db`   |
-| `DB_USERNAME` | `esg`                                           |
-| `DB_PASSWORD` | `esg`                                           |
+| Variable | Service | Default |
+|----------|---------|---------|
+| `DB_URL` | both | `jdbc:postgresql://localhost:5432/company_db` / `.../score_db` |
+| `DB_USERNAME`, `DB_PASSWORD` | both | `esg` / `esg` |
+| `RABBITMQ_HOST`, `RABBITMQ_PORT` | esg-score-service | `localhost` / `5672` |
+| `RABBITMQ_USERNAME`, `RABBITMQ_PASSWORD` | esg-score-service | `esg` / `esg` |
+| `COMPANY_SERVICE_URL` | esg-score-service | `http://localhost:8081` |
+| `JAVA_OPTS` | multi-stage images | `-XX:+UseContainerSupport -XX:MaxRAMPercentage=75` |
 
 If port 5432 is already taken by a local Postgres installation, change the mapping in
-`docker-compose.yml` to `"5433:5432"` and start the app with:
-
-```
-$env:DB_URL = "jdbc:postgresql://localhost:5433/company_db"
-java -jar company-service/target/company-service-0.0.1-SNAPSHOT.jar
-```
+`docker-compose.yml` to `"5433:5432"` and set `DB_URL` accordingly, e.g.
+`$env:DB_URL = "jdbc:postgresql://localhost:5433/company_db"`.
 
 ## Stopping
 
-| Command                  | Effect                                       |
-|--------------------------|----------------------------------------------|
-| `docker compose stop`    | stops Postgres, keeps container and data     |
-| `docker compose down`    | removes the container, keeps data            |
-| `docker compose down -v` | removes container **and data** (full reset)  |
+| Command                  | Effect                                              |
+|--------------------------|-----------------------------------------------------|
+| `docker compose stop`    | stops Postgres + RabbitMQ, keeps containers and data |
+| `docker compose down`    | removes the containers, keeps data                  |
+| `docker compose down -v` | removes containers **and data** (full reset)        |
