@@ -4,6 +4,9 @@ A deliberately simplified, reproducible microservice platform used as a controll
 environment for measuring resource efficiency (Kubernetes resource limits, container image
 optimisation, CI pipeline caching).
 
+**New here?** Read [docs/company-service-guide.md](docs/company-service-guide.md) — architecture,
+a file-by-file tour, request flow, and hands-on labs.
+
 ## Repository layout
 
 ```
