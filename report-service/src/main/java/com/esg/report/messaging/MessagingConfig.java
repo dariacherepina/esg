@@ -1,0 +1,71 @@
+package com.esg.report.messaging;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.amqp.core.Binding;
+import org.springframework.amqp.core.BindingBuilder;
+import org.springframework.amqp.core.Queue;
+import org.springframework.amqp.core.QueueBuilder;
+import org.springframework.amqp.core.TopicExchange;
+import org.springframework.amqp.support.converter.DefaultJackson2JavaTypeMapper;
+import org.springframework.amqp.support.converter.Jackson2JsonMessageConverter;
+import org.springframework.amqp.support.converter.MessageConverter;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import java.util.Map;
+
+/**
+ * This service's OWN queue, bound to score.updated on the shared exchange — separate from
+ * portfolio-service's queue, so both receive every event (fan-out).
+ *
+ * <pre>
+ * esg.events ──score.updated──► report-service.score-updated ──(after 3 failed attempts)──►
+ *                                                     report-service.score-updated.dlq
+ * </pre>
+ */
+@Configuration
+public class MessagingConfig {
+
+    public static final String EXCHANGE = "esg.events";
+    public static final String SCORE_UPDATED_ROUTING_KEY = "score.updated";
+    public static final String QUEUE = "report-service.score-updated";
+    public static final String DEAD_LETTER_QUEUE = QUEUE + ".dlq";
+
+    /** Declared here too (idempotent), so the binding works even if esg-score-service never ran. */
+    @Bean
+    public TopicExchange esgEventsExchange() {
+        return new TopicExchange(EXCHANGE, true, false);
+    }
+
+    /**
+     * Durable: events published while this service is down wait here. Because reports live in memory,
+     * this is also what rebuilds them after a restart — as long as the events have not been consumed yet.
+     */
+    @Bean
+    public Queue scoreUpdatedQueue() {
+        return QueueBuilder.durable(QUEUE)
+                .deadLetterExchange("")
+                .deadLetterRoutingKey(DEAD_LETTER_QUEUE)
+                .build();
+    }
+
+    @Bean
+    public Queue scoreUpdatedDeadLetterQueue() {
+        return QueueBuilder.durable(DEAD_LETTER_QUEUE).build();
+    }
+
+    @Bean
+    public Binding scoreUpdatedBinding(Queue scoreUpdatedQueue, TopicExchange esgEventsExchange) {
+        return BindingBuilder.bind(scoreUpdatedQueue).to(esgEventsExchange).with(SCORE_UPDATED_ROUTING_KEY);
+    }
+
+    /** Maps the logical type id "scoreUpdated" (set by the publisher) to this service's own class. */
+    @Bean
+    public MessageConverter jsonMessageConverter(ObjectMapper objectMapper) {
+        Jackson2JsonMessageConverter converter = new Jackson2JsonMessageConverter(objectMapper);
+        DefaultJackson2JavaTypeMapper typeMapper = new DefaultJackson2JavaTypeMapper();
+        typeMapper.setIdClassMapping(Map.of("scoreUpdated", ScoreUpdatedEvent.class));
+        converter.setJavaTypeMapper(typeMapper);
+        return converter;
+    }
+}

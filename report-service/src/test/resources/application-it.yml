@@ -1,0 +1,7 @@
+# Active only in integration tests (@ActiveProfiles("it")).
+spring:
+  rabbitmq:
+    listener:
+      simple:
+        retry:
+          initial-interval: 100ms   # keep the dead-letter test fast

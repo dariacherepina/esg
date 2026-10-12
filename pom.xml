@@ -21,6 +21,7 @@
         <module>company-service</module>
         <module>esg-score-service</module>
         <module>portfolio-service</module>
+        <module>report-service</module>
     </modules>
 
     <properties>
