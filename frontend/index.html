@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESG Screening</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">◐</span>
+      <div>
+        <h1>ESG Screening</h1>
+        <p class="subtitle">Companies, scores and sustainability reports</p>
+      </div>
+    </div>
+    <div class="actions">
+      <span id="updated" class="muted"></span>
+      <button id="recalculate" type="button">Recalculate all scores</button>
+    </div>
+  </header>
+
+  <div id="alerts" class="alerts" aria-live="polite"></div>
+
+  <main class="layout">
+    <section class="panel companies" aria-labelledby="companies-title">
+      <div class="panel-head">
+        <h2 id="companies-title">Companies <span id="count" class="muted"></span></h2>
+        <div class="filters">
+          <input id="search" type="search" placeholder="Search name…" aria-label="Search by name">
+          <select id="sector" aria-label="Filter by sector">
+            <option value="">All sectors</option>
+            <option value="TECHNOLOGY">Technology</option>
+            <option value="ENERGY">Energy</option>
+            <option value="FINANCE">Finance</option>
+            <option value="MANUFACTURING">Manufacturing</option>
+          </select>
+          <select id="rating" aria-label="Filter by rating">
+            <option value="">All ratings</option>
+            <option value="EXCELLENT">Excellent</option>
+            <option value="GOOD">Good</option>
+            <option value="FAIR">Fair</option>
+            <option value="POOR">Poor</option>
+            <option value="NONE">Not scored</option>
+          </select>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th class="num">#</th>
+              <th>Company</th>
+              <th>Sector</th>
+              <th class="num">E</th>
+              <th class="num">S</th>
+              <th class="num">G</th>
+              <th>Total score</th>
+              <th>Rating</th>
+            </tr>
+          </thead>
+          <tbody id="company-rows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <aside class="side">
+      <section class="panel" id="detail" aria-labelledby="detail-title">
+        <h2 id="detail-title">Company details</h2>
+        <p class="muted">Select a company to see its raw ESG data, pillar scores and recommendations.</p>
+      </section>
+
+      <section class="panel" aria-labelledby="portfolios-title">
+        <h2 id="portfolios-title">Portfolios</h2>
+        <ul id="portfolios" class="portfolios"></ul>
+      </section>
+    </aside>
+  </main>
+
+  <footer class="footer muted">
+    Data refreshes every 5 seconds. Scores: E × 0.40 + S × 0.35 + G × 0.25.
+    Ratings: Poor &lt; 40 ≤ Fair &lt; 60 ≤ Good &lt; 80 ≤ Excellent.
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

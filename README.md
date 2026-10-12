@@ -45,6 +45,7 @@ esg/
 │   └── src/main/resources/db/migration/   # Flyway: schema (V1) and 3 seed portfolios (V2)
 ├── report-service/              # port 8084, no database
 │   └── Dockerfile, Dockerfile.multistage
+├── frontend/                    # optional web UI (nginx, port 8080)
 └── docs/                        # guides
 ```
 
@@ -70,6 +71,24 @@ java -jar report-service/target/report-service-0.0.1-SNAPSHOT.jar
 ```
 
 Stop a service with `Ctrl+C`. RabbitMQ's management UI: <http://localhost:15672> (`esg` / `esg`).
+
+### Web UI (optional)
+
+```powershell
+docker compose --profile ui up -d --build     # http://localhost:8080
+docker compose --profile ui stop frontend
+```
+
+A small read-only dashboard: all companies with pillar scores, total score and rating
+(filter by name, sector, rating); click a company for its raw ESG data and recommendations;
+portfolios with their aggregate scores. It refreshes every 5 seconds — press
+**Recalculate all scores** and watch portfolios and reports update via the events.
+Links like `http://localhost:8080/#company=6` open a company directly.
+
+The UI is plain HTML/CSS/JS in [frontend/](frontend/), served by nginx, which also forwards
+`/api/...` to the four services (so no CORS setup is needed). It is **not** one of the measured
+services and only starts with `--profile ui`. When the services run as containers, point
+nginx at them with `-e COMPANY_SERVICE_URL=http://cs:8081` etc.
 
 ## Verifying the setup
 

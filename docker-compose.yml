@@ -31,5 +31,19 @@ services:
       timeout: 5s
       retries: 10
 
+  # Web UI — only started on request: docker compose --profile ui up -d
+  # Not part of the experiments. Forwards /api/... to the services running on the host.
+  frontend:
+    profiles: ["ui"]
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    image: esg-frontend
+    container_name: esg-frontend
+    ports:
+      - "8080:8080"   # http://localhost:8080
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
 volumes:
   postgres-data:
