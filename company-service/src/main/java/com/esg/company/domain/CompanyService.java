@@ -11,6 +11,7 @@ public class CompanyService {
 
     private final CompanyRepository repository;
 
+    /**Constructor injection */
     public CompanyService(CompanyRepository repository) {
         this.repository = repository;
     }

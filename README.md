@@ -19,35 +19,6 @@ optimisation, CI pipeline caching).
 | portfolio-service | 8083 | `portfolio_db` | portfolios with weighted aggregate score, consumes `score.updated` | ✅ |
 | report-service | 8084 | — (in memory) | sustainability reports with rating + recommendations, consumes `score.updated` | ✅ |
 
-```
-company-service ◄── REST ── esg-score-service ── score.updated ──► RabbitMQ exchange "esg.events"
-                                   ▲                                 ├──► portfolio-service ─┐
-                                   └──── REST (initial scores) ──────┼───────────────────────┘
-                                                                     └──► report-service
-```
-
-## Repository layout
-
-```
-esg/
-├── pom.xml                      # Maven parent POM (Spring Boot 3.5, Java 21)
-├── docker-compose.yml           # local PostgreSQL + RabbitMQ for development
-├── docker/postgres/init/        # SQL run once on first Postgres start (creates databases)
-├── company-service/             # port 8081
-│   ├── Dockerfile               # single-stage variant
-│   ├── Dockerfile.multistage    # multi-stage variant
-│   └── src/main/resources/db/migration/   # Flyway: schema (V1) and 20 seed companies (V2)
-├── esg-score-service/           # port 8082
-│   ├── Dockerfile, Dockerfile.multistage
-│   └── src/main/java/com/esg/score/scoring/   # pure-Java scoring formula
-├── portfolio-service/           # port 8083
-│   ├── Dockerfile, Dockerfile.multistage
-│   └── src/main/resources/db/migration/   # Flyway: schema (V1) and 3 seed portfolios (V2)
-├── report-service/              # port 8084, no database
-│   └── Dockerfile, Dockerfile.multistage
-├── frontend/                    # optional web UI (nginx, port 8080)
-└── docs/                        # guides
-```
 
 ## Prerequisites
 
