@@ -8,6 +8,7 @@ optimisation, CI pipeline caching).
 - [docs/company-service-guide.md](docs/company-service-guide.md)
 - [docs/esg-score-service-guide.md](docs/esg-score-service-guide.md)
 - [docs/portfolio-service-guide.md](docs/portfolio-service-guide.md)
+- [docs/report-service-guide.md](docs/report-service-guide.md)
 
 ## Services
 
@@ -16,13 +17,13 @@ optimisation, CI pipeline caching).
 | company-service | 8081 | `company_db` | company profiles + raw ESG data, CRUD, 20 seed companies | ✅ |
 | esg-score-service | 8082 | `score_db` | fetches raw data via REST, calculates scores, publishes `score.updated` | ✅ |
 | portfolio-service | 8083 | `portfolio_db` | portfolios with weighted aggregate score, consumes `score.updated` | ✅ |
-| report-service | 8084 | — (in memory) | sustainability reports, consumes `score.updated` | planned |
+| report-service | 8084 | — (in memory) | sustainability reports with rating + recommendations, consumes `score.updated` | ✅ |
 
 ```
 company-service ◄── REST ── esg-score-service ── score.updated ──► RabbitMQ exchange "esg.events"
                                    ▲                                 ├──► portfolio-service ─┐
                                    └──── REST (initial scores) ──────┼───────────────────────┘
-                                                                     └──► report-service (planned)
+                                                                     └──► report-service
 ```
 
 ## Repository layout
@@ -42,6 +43,8 @@ esg/
 ├── portfolio-service/           # port 8083
 │   ├── Dockerfile, Dockerfile.multistage
 │   └── src/main/resources/db/migration/   # Flyway: schema (V1) and 3 seed portfolios (V2)
+├── report-service/              # port 8084, no database
+│   └── Dockerfile, Dockerfile.multistage
 └── docs/                        # guides
 ```
 
@@ -63,6 +66,7 @@ mvn package -DskipTests                                       # all services
 java -jar company-service/target/company-service-0.0.1-SNAPSHOT.jar
 java -jar esg-score-service/target/esg-score-service-0.0.1-SNAPSHOT.jar
 java -jar portfolio-service/target/portfolio-service-0.0.1-SNAPSHOT.jar
+java -jar report-service/target/report-service-0.0.1-SNAPSHOT.jar
 ```
 
 Stop a service with `Ctrl+C`. RabbitMQ's management UI: <http://localhost:15672> (`esg` / `esg`).
@@ -133,6 +137,14 @@ Invoke-RestMethod http://localhost:8083/api/portfolios | Format-Table id, name, 
 
 On a fresh database: Sustainable Leaders 94.75, Balanced Mix 69.04, Heavy Industry 20.99.
 
+### Check 7 — reports were generated from the same events
+
+```powershell
+Invoke-RestMethod http://localhost:8084/api/reports | Group-Object rating | Format-Table Name, Count
+```
+
+20 reports: 5 EXCELLENT, 5 GOOD, 5 FAIR, 5 POOR.
+
 ## Running the tests
 
 | Command | Runs | Needs Docker |
@@ -146,6 +158,7 @@ On a fresh database: Sustainable Leaders 94.75, Balanced Mix 69.04, Heavy Indust
 | company-service | 25 | 9 (Postgres) |
 | esg-score-service | 44 | 4 (Postgres + RabbitMQ) |
 | portfolio-service | 31 | 5 (Postgres + RabbitMQ) |
+| report-service | 24 | 4 (RabbitMQ only) |
 
 Integration tests start their own throwaway containers via Testcontainers — they do **not**
 use (or touch) the docker-compose infrastructure, so they can run while the apps are running.
@@ -251,6 +264,8 @@ receives every event (fan-out).
 |-------|-------|---------|
 | `portfolio-service.score-updated` | portfolio-service | durable; events wait here while the service is down |
 | `portfolio-service.score-updated.dlq` | portfolio-service | messages that failed 3 attempts (or weren't valid JSON) |
+| `report-service.score-updated` | report-service | durable; same role for reports |
+| `report-service.score-updated.dlq` | report-service | failed messages |
 
 ## portfolio-service REST API
 
@@ -281,6 +296,29 @@ Invoke-RestMethod http://localhost:8083/api/portfolios -Method Post -ContentType
 - Current scores are fetched from esg-score-service on create/update; afterwards
   `score.updated` events keep them current. Older events are ignored.
 
+## report-service REST API
+
+Base URL: `http://localhost:8084/api/reports` — read-only; reports are created only by events.
+
+| Method | Path | Success | Errors |
+|--------|------|---------|--------|
+| `GET` | `/api/reports` | 200 + list (ordered by company id) | — |
+| `GET` | `/api/reports?rating=POOR` | 200 + filtered list | 400 (unknown rating) |
+| `GET` | `/api/reports/{companyId}` | 200 | 404 (no score received yet) |
+
+```json
+{"companyId":20,"companyName":"Ashgrove Cement","totalScore":13.33,"rating":"POOR",
+ "recommendations":["Commission an independent ESG risk assessment",
+   "Prioritise immediate reductions in emissions and water use",
+   "Establish board-level oversight of ESG risks",
+   "Implement a whistleblowing and anti-corruption programme"],
+ "scoreCalculatedAt":"2026-10-12T13:29:57.887Z","generatedAt":"2026-10-12T13:29:57.918Z"}
+```
+
+- **Rating bands:** POOR < 40 ≤ FAIR < 60 ≤ GOOD < 80 ≤ EXCELLENT; fixed recommendations per band.
+- **In memory only:** the store is empty after a restart. Events published while the service
+  was down wait in its queue; otherwise `POST /api/scores` on esg-score-service rebuilds all reports.
+
 ## Health and metrics (Actuator)
 
 Both services expose:
@@ -305,6 +343,8 @@ experiments:
 | `esg_scores_calculated_total`           | score calculations (esg-score-service) |
 | `portfolio_score_events_total`          | `score.updated` events processed (portfolio-service) |
 | `portfolio_aggregate_recalculations_total` | portfolios changed by those events |
+| `reports_generated_total`, `reports_stored` | reports built / held in memory (report-service) |
+| `jvm_classes_loaded_classes`            | framework footprint per service  |
 | `hikaricp_connections_active`           | DB connection pool usage         |
 | `application_ready_time_seconds`        | startup time                     |
 
@@ -326,6 +366,8 @@ docker build -f esg-score-service/Dockerfile            -t esg-score-service:sin
 docker build -f esg-score-service/Dockerfile.multistage -t esg-score-service:multi  .
 docker build -f portfolio-service/Dockerfile            -t portfolio-service:single .
 docker build -f portfolio-service/Dockerfile.multistage -t portfolio-service:multi  .
+docker build -f report-service/Dockerfile               -t report-service:single    .
+docker build -f report-service/Dockerfile.multistage    -t report-service:multi     .
 ```
 
 Inside the Dockerfiles each module is built with `mvn -f <service>/pom.xml`: the parent POM
@@ -338,12 +380,22 @@ is used for inheritance only, so the other modules don't need to be in the build
 
 Measured (Docker 28, containerd image store):
 
-| | company | score | portfolio |
-|-|---------|-------|-----------|
-| Compressed, single → multi (what `docker pull` transfers) | 404 → 127 MB | 406 → 128 MB | 408 → 129 MB |
-| Unpacked, single → multi (sum of layers in `docker history`) | ~755 → ~272 MB | ~757 → ~273 MB | ~760 → ~274 MB |
-| Max heap with `--memory=512m`, single → multi | 128 → 384 MB | 128 → 384 MB | 128 → 384 MB |
-| Container memory after startup (multi, 512 MB limit) | ~224 MB | ~233 MB | ~272 MB |
+| | company | score | portfolio | report |
+|-|---------|-------|-----------|--------|
+| Compressed, single → multi (what `docker pull` transfers) | 404 → 127 MB | 406 → 128 MB | 408 → 129 MB | 356 → 99 MB |
+| Unpacked, single → multi (sum of layers in `docker history`) | ~755 → ~272 MB | ~757 → ~273 MB | ~760 → ~274 MB | ~700 → ~241 MB |
+| Max heap with `--memory=512m`, single → multi | 128 → 384 MB | 128 → 384 MB | 128 → 384 MB | 128 → 384 MB |
+
+All four multi-stage containers running together (512 MB limit each, after `POST /api/scores`):
+
+| | company | score | portfolio | report |
+|-|---------|-------|-----------|--------|
+| Startup (`application_ready_time_seconds`) | 14.6 s | 14.3 s | 15.3 s | 9.3 s |
+| Classes loaded | 16,695 | 17,277 | 19,494 | 10,615 |
+| Container memory | 227 MB | 237 MB | 271 MB | 168 MB |
+
+report-service has no JPA/JDBC/Flyway, which shows in every row. Startup times are higher
+than for a single service because all four JVMs start at once and compete for CPU.
 
 > **Measure size consistently.** With the containerd image store, `docker image ls` adds the
 > compressed and unpacked sizes together (e.g. 1.16 GB / 399 MB). Use the compressed size
@@ -364,7 +416,10 @@ docker run -d --name ps --network esg_default --memory=512m -p 18083:8083 `
   -e DB_URL=jdbc:postgresql://esg-postgres:5432/portfolio_db `
   -e RABBITMQ_HOST=esg-rabbitmq -e SCORE_SERVICE_URL=http://ss:8082 portfolio-service:multi
 
-docker rm -f cs ss ps   # stop and remove
+docker run -d --name rs --network esg_default --memory=512m -p 18084:8084 `
+  -e RABBITMQ_HOST=esg-rabbitmq report-service:multi
+
+docker rm -f cs ss ps rs   # stop and remove
 ```
 
 Switch the JVM flags off for the experiment with `-e JAVA_OPTS=`.
@@ -384,7 +439,8 @@ companies — 5 per sector, spread over the rating bands (5 Excellent, 5 Good, 5
 | `transparency_score`   | disclosure quality rating         | 0–100  | higher |
 
 **Before every experiment run**, reset to the known state (company ids 1–20, no scores,
-3 unscored seed portfolios, empty queues):
+3 unscored seed portfolios, empty queues) and restart the services (report-service's
+in-memory store is only emptied by a restart):
 
 ```
 docker compose down -v
@@ -400,10 +456,10 @@ Every setting can be overridden with an environment variable; the defaults work 
 
 | Variable | Service | Default |
 |----------|---------|---------|
-| `DB_URL` | all | `jdbc:postgresql://localhost:5432/<company_db, score_db, portfolio_db>` |
-| `DB_USERNAME`, `DB_PASSWORD` | all | `esg` / `esg` |
-| `RABBITMQ_HOST`, `RABBITMQ_PORT` | score, portfolio | `localhost` / `5672` |
-| `RABBITMQ_USERNAME`, `RABBITMQ_PASSWORD` | score, portfolio | `esg` / `esg` |
+| `DB_URL` | company, score, portfolio | `jdbc:postgresql://localhost:5432/<company_db, score_db, portfolio_db>` |
+| `DB_USERNAME`, `DB_PASSWORD` | company, score, portfolio | `esg` / `esg` |
+| `RABBITMQ_HOST`, `RABBITMQ_PORT` | score, portfolio, report | `localhost` / `5672` |
+| `RABBITMQ_USERNAME`, `RABBITMQ_PASSWORD` | score, portfolio, report | `esg` / `esg` |
 | `COMPANY_SERVICE_URL` | esg-score-service | `http://localhost:8081` |
 | `SCORE_SERVICE_URL` | portfolio-service | `http://localhost:8082` |
 | `JAVA_OPTS` | multi-stage images | `-XX:+UseContainerSupport -XX:MaxRAMPercentage=75` |
