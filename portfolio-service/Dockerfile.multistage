@@ -1,0 +1,42 @@
+# Multi-stage build — the OPTIMISED variant for the container experiment.
+# Stage 1 builds the JAR with JDK + Maven; stage 2 ships only a JRE and the JAR.
+#
+# Build from the repo root:
+#   docker build -f portfolio-service/Dockerfile.multistage -t portfolio-service:multi .
+#
+# JVM flags are set via JAVA_OPTS and can be switched off for the experiment:
+#   docker run -e JAVA_OPTS="" portfolio-service:multi
+
+# ---------- Stage 1: build ----------
+FROM maven:3.9-eclipse-temurin-21 AS build
+
+WORKDIR /build
+
+# POMs first: this layer (and the dependency download) is reused by Docker
+# as long as no pom.xml changes, even when the source code changes.
+# -f builds the module via its own POM; the parent is read only for inheritance, so the other
+# modules listed in the root POM don't need to be in the build context.
+COPY pom.xml .
+COPY portfolio-service/pom.xml ./portfolio-service/
+RUN mvn -B -q -f portfolio-service/pom.xml dependency:go-offline
+
+COPY portfolio-service/src ./portfolio-service/src
+RUN mvn -B -q -f portfolio-service/pom.xml package -DskipTests
+
+# ---------- Stage 2: runtime ----------
+FROM eclipse-temurin:21-jre-alpine
+
+# Do not run as root inside the container
+RUN addgroup -S app && adduser -S app -G app
+USER app
+
+WORKDIR /app
+COPY --from=build /build/portfolio-service/target/portfolio-service-0.0.1-SNAPSHOT.jar app.jar
+
+# UseContainerSupport: read CPU/memory limits from the container (default since JDK 10, set explicitly).
+# MaxRAMPercentage=75: max heap = 75% of the container memory limit instead of the default 25%.
+ENV JAVA_OPTS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=75"
+
+EXPOSE 8083
+# sh -c so $JAVA_OPTS is expanded; exec so java becomes PID 1 and receives SIGTERM from Kubernetes
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/app.jar"]

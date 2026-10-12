@@ -7,6 +7,7 @@ optimisation, CI pipeline caching).
 **Guides** — architecture, file-by-file tours, request flows and hands-on labs:
 - [docs/company-service-guide.md](docs/company-service-guide.md)
 - [docs/esg-score-service-guide.md](docs/esg-score-service-guide.md)
+- [docs/portfolio-service-guide.md](docs/portfolio-service-guide.md)
 
 ## Services
 
@@ -14,13 +15,14 @@ optimisation, CI pipeline caching).
 |---------|------|----------|------|--------|
 | company-service | 8081 | `company_db` | company profiles + raw ESG data, CRUD, 20 seed companies | ✅ |
 | esg-score-service | 8082 | `score_db` | fetches raw data via REST, calculates scores, publishes `score.updated` | ✅ |
-| portfolio-service | 8083 | `portfolio_db` | portfolios, consumes `score.updated` | planned |
+| portfolio-service | 8083 | `portfolio_db` | portfolios with weighted aggregate score, consumes `score.updated` | ✅ |
 | report-service | 8084 | — (in memory) | sustainability reports, consumes `score.updated` | planned |
 
 ```
 company-service ◄── REST ── esg-score-service ── score.updated ──► RabbitMQ exchange "esg.events"
-                                                                     ├──► portfolio-service (planned)
-                                                                     └──► report-service    (planned)
+                                   ▲                                 ├──► portfolio-service ─┐
+                                   └──── REST (initial scores) ──────┼───────────────────────┘
+                                                                     └──► report-service (planned)
 ```
 
 ## Repository layout
@@ -37,6 +39,9 @@ esg/
 ├── esg-score-service/           # port 8082
 │   ├── Dockerfile, Dockerfile.multistage
 │   └── src/main/java/com/esg/score/scoring/   # pure-Java scoring formula
+├── portfolio-service/           # port 8083
+│   ├── Dockerfile, Dockerfile.multistage
+│   └── src/main/resources/db/migration/   # Flyway: schema (V1) and 3 seed portfolios (V2)
 └── docs/                        # guides
 ```
 
@@ -52,11 +57,12 @@ All commands are run from the repository root.
 
 ```powershell
 docker compose up -d                                          # Postgres + RabbitMQ
-mvn -pl company-service,esg-score-service -am package -DskipTests
+mvn package -DskipTests                                       # all services
 
 # one terminal per service
 java -jar company-service/target/company-service-0.0.1-SNAPSHOT.jar
 java -jar esg-score-service/target/esg-score-service-0.0.1-SNAPSHOT.jar
+java -jar portfolio-service/target/portfolio-service-0.0.1-SNAPSHOT.jar
 ```
 
 Stop a service with `Ctrl+C`. RabbitMQ's management UI: <http://localhost:15672> (`esg` / `esg`).
@@ -80,7 +86,7 @@ If you see `error during connect ... dockerDesktopLinuxEngine`, Docker Desktop i
 docker exec -it esg-postgres psql -U esg -c "\l"
 ```
 
-`company_db` and `score_db` must appear in the `Name` column. If one is missing, the init
+`company_db`, `score_db` and `portfolio_db` must appear in the `Name` column. If one is missing, the init
 script did not run (it only runs on an **empty** volume). Reset the volume:
 
 ```
@@ -119,6 +125,14 @@ Invoke-RestMethod http://localhost:8082/api/scores -Method Post | Format-Table c
 20 rows; Voltara Renewables (id 6) = 92.6. In the RabbitMQ UI, exchange `esg.events` shows
 a spike in its message rate.
 
+### Check 6 — portfolios were updated by the events
+
+```powershell
+Invoke-RestMethod http://localhost:8083/api/portfolios | Format-Table id, name, aggregateScore
+```
+
+On a fresh database: Sustainable Leaders 94.75, Balanced Mix 69.04, Heavy Industry 20.99.
+
 ## Running the tests
 
 | Command | Runs | Needs Docker |
@@ -131,6 +145,7 @@ a spike in its message rate.
 |---------|--------|---------------|
 | company-service | 25 | 9 (Postgres) |
 | esg-score-service | 44 | 4 (Postgres + RabbitMQ) |
+| portfolio-service | 31 | 5 (Postgres + RabbitMQ) |
 
 Integration tests start their own throwaway containers via Testcontainers — they do **not**
 use (or touch) the docker-compose infrastructure, so they can run while the apps are running.
@@ -232,6 +247,40 @@ Total = E × 0.40 + S × 0.35 + G × 0.25          (all rounded to 2 decimals)
 Consumers declare their **own** queue and bind it to `score.updated` — every bound queue
 receives every event (fan-out).
 
+| Queue | Owner | Purpose |
+|-------|-------|---------|
+| `portfolio-service.score-updated` | portfolio-service | durable; events wait here while the service is down |
+| `portfolio-service.score-updated.dlq` | portfolio-service | messages that failed 3 attempts (or weren't valid JSON) |
+
+## portfolio-service REST API
+
+Base URL: `http://localhost:8083/api/portfolios`
+
+| Method   | Path                    | Success                   | Errors        |
+|----------|-------------------------|---------------------------|---------------|
+| `GET`    | `/api/portfolios`       | 200 + list (ordered by id)| —             |
+| `GET`    | `/api/portfolios/{id}`  | 200                       | 404           |
+| `POST`   | `/api/portfolios`       | 201 + `Location` header   | 400, 409      |
+| `PUT`    | `/api/portfolios/{id}`  | 200 (replaces name + holdings) | 400, 404, 409 |
+| `DELETE` | `/api/portfolios/{id}`  | 204                       | 404           |
+
+```powershell
+$body = @{ name = "Mixed Energy"; holdings = @(
+  @{ companyId = 6; weight = 0.5 }, @{ companyId = 10; weight = 0.5 }) } | ConvertTo-Json
+Invoke-RestMethod http://localhost:8083/api/portfolios -Method Post -ContentType "application/json" -Body $body
+```
+
+```json
+{"id":4,"name":"Mixed Energy","aggregateScore":56.82,"holdings":[
+  {"companyId":6,"companyName":"Voltara Renewables","weight":0.5,"esgScore":92.6,"scoreCalculatedAt":"..."},
+  {"companyId":10,"companyName":"Carbonex Fuels","weight":0.5,"esgScore":21.03,"scoreCalculatedAt":"..."}]}
+```
+
+- **Aggregate** = Σ(weight × score) / Σ weight over holdings that have a score (`null` until one does).
+- **Rules:** weight in (0, 1]; weights sum ≤ 1; each company at most once; name unique (409).
+- Current scores are fetched from esg-score-service on create/update; afterwards
+  `score.updated` events keep them current. Older events are ignored.
+
 ## Health and metrics (Actuator)
 
 Both services expose:
@@ -254,6 +303,8 @@ experiments:
 | `http_server_requests_seconds_*`        | request rate and latency (p95/p99) under load |
 | `http_client_requests_seconds_*`        | esg-score-service → company-service calls |
 | `esg_scores_calculated_total`           | score calculations (esg-score-service) |
+| `portfolio_score_events_total`          | `score.updated` events processed (portfolio-service) |
+| `portfolio_aggregate_recalculations_total` | portfolios changed by those events |
 | `hikaricp_connections_active`           | DB connection pool usage         |
 | `application_ready_time_seconds`        | startup time                     |
 
@@ -273,6 +324,8 @@ docker build -f company-service/Dockerfile              -t company-service:singl
 docker build -f company-service/Dockerfile.multistage   -t company-service:multi    .
 docker build -f esg-score-service/Dockerfile            -t esg-score-service:single .
 docker build -f esg-score-service/Dockerfile.multistage -t esg-score-service:multi  .
+docker build -f portfolio-service/Dockerfile            -t portfolio-service:single .
+docker build -f portfolio-service/Dockerfile.multistage -t portfolio-service:multi  .
 ```
 
 Inside the Dockerfiles each module is built with `mvn -f <service>/pom.xml`: the parent POM
@@ -285,11 +338,12 @@ is used for inheritance only, so the other modules don't need to be in the build
 
 Measured (Docker 28, containerd image store):
 
-| | company single | company multi | score single | score multi |
-|-|----------------|---------------|--------------|-------------|
-| Compressed (what `docker pull` transfers) | 404 MB | 127 MB | 406 MB | 128 MB |
-| Unpacked (sum of layers in `docker history`) | ~755 MB | ~272 MB | ~757 MB | ~273 MB |
-| Max heap with `--memory=512m` | 128 MB (25 %) | 384 MB (75 %) | 128 MB | 384 MB |
+| | company | score | portfolio |
+|-|---------|-------|-----------|
+| Compressed, single → multi (what `docker pull` transfers) | 404 → 127 MB | 406 → 128 MB | 408 → 129 MB |
+| Unpacked, single → multi (sum of layers in `docker history`) | ~755 → ~272 MB | ~757 → ~273 MB | ~760 → ~274 MB |
+| Max heap with `--memory=512m`, single → multi | 128 → 384 MB | 128 → 384 MB | 128 → 384 MB |
+| Container memory after startup (multi, 512 MB limit) | ~224 MB | ~233 MB | ~272 MB |
 
 > **Measure size consistently.** With the containerd image store, `docker image ls` adds the
 > compressed and unpacked sizes together (e.g. 1.16 GB / 399 MB). Use the compressed size
@@ -306,7 +360,11 @@ docker run -d --name ss --network esg_default --memory=512m -p 18082:8082 `
   -e DB_URL=jdbc:postgresql://esg-postgres:5432/score_db `
   -e RABBITMQ_HOST=esg-rabbitmq -e COMPANY_SERVICE_URL=http://cs:8081 esg-score-service:multi
 
-docker rm -f cs ss      # stop and remove
+docker run -d --name ps --network esg_default --memory=512m -p 18083:8083 `
+  -e DB_URL=jdbc:postgresql://esg-postgres:5432/portfolio_db `
+  -e RABBITMQ_HOST=esg-rabbitmq -e SCORE_SERVICE_URL=http://ss:8082 portfolio-service:multi
+
+docker rm -f cs ss ps   # stop and remove
 ```
 
 Switch the JVM flags off for the experiment with `-e JAVA_OPTS=`.
@@ -326,7 +384,7 @@ companies — 5 per sector, spread over the rating bands (5 Excellent, 5 Good, 5
 | `transparency_score`   | disclosure quality rating         | 0–100  | higher |
 
 **Before every experiment run**, reset to the known state (company ids 1–20, no scores,
-empty queues):
+3 unscored seed portfolios, empty queues):
 
 ```
 docker compose down -v
@@ -342,11 +400,12 @@ Every setting can be overridden with an environment variable; the defaults work 
 
 | Variable | Service | Default |
 |----------|---------|---------|
-| `DB_URL` | both | `jdbc:postgresql://localhost:5432/company_db` / `.../score_db` |
-| `DB_USERNAME`, `DB_PASSWORD` | both | `esg` / `esg` |
-| `RABBITMQ_HOST`, `RABBITMQ_PORT` | esg-score-service | `localhost` / `5672` |
-| `RABBITMQ_USERNAME`, `RABBITMQ_PASSWORD` | esg-score-service | `esg` / `esg` |
+| `DB_URL` | all | `jdbc:postgresql://localhost:5432/<company_db, score_db, portfolio_db>` |
+| `DB_USERNAME`, `DB_PASSWORD` | all | `esg` / `esg` |
+| `RABBITMQ_HOST`, `RABBITMQ_PORT` | score, portfolio | `localhost` / `5672` |
+| `RABBITMQ_USERNAME`, `RABBITMQ_PASSWORD` | score, portfolio | `esg` / `esg` |
 | `COMPANY_SERVICE_URL` | esg-score-service | `http://localhost:8081` |
+| `SCORE_SERVICE_URL` | portfolio-service | `http://localhost:8082` |
 | `JAVA_OPTS` | multi-stage images | `-XX:+UseContainerSupport -XX:MaxRAMPercentage=75` |
 
 If port 5432 is already taken by a local Postgres installation, change the mapping in
