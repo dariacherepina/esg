@@ -1,0 +1,9 @@
+# Active only in integration tests (@ActiveProfiles("it")).
+spring:
+  flyway:
+    clean-disabled: false
+  rabbitmq:
+    listener:
+      simple:
+        retry:
+          initial-interval: 100ms   # keep the dead-letter test fast

@@ -1,0 +1,48 @@
+server:
+  port: 8083
+
+spring:
+  application:
+    name: portfolio-service
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/portfolio_db}
+    username: ${DB_USERNAME:esg}
+    password: ${DB_PASSWORD:esg}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:esg}
+    password: ${RABBITMQ_PASSWORD:esg}
+    listener:
+      simple:
+        # A failing message is retried 3 times (1 s, 2 s apart), then rejected WITHOUT requeue,
+        # which routes it to the dead-letter queue instead of redelivering it forever.
+        retry:
+          enabled: true
+          max-attempts: 3
+          initial-interval: 1s
+          multiplier: 2
+        default-requeue-rejected: false
+
+score-service:
+  url: ${SCORE_SERVICE_URL:http://localhost:8082}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
