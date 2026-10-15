@@ -347,7 +347,8 @@ $metrics -split "`n" | Select-String '^jvm_memory_used_bytes.*area="heap"' | For
 
 ## Docker images
 
-Two variants per service, both built **from the repository root**:
+Three variants per service, all built **from the repository root**. The multi-stage
+Dockerfile takes the runtime base image as a build argument (default: Alpine):
 
 ```powershell
 docker build -f company-service/Dockerfile              -t company-service:single   .
@@ -358,7 +359,15 @@ docker build -f portfolio-service/Dockerfile            -t portfolio-service:sin
 docker build -f portfolio-service/Dockerfile.multistage -t portfolio-service:multi  .
 docker build -f report-service/Dockerfile               -t report-service:single    .
 docker build -f report-service/Dockerfile.multistage    -t report-service:multi     .
+
+# Ubuntu-based runtime instead of Alpine (same for every service)
+docker build -f company-service/Dockerfile.multistage -t company-service:multi-jre `
+  --build-arg RUNTIME_IMAGE=eclipse-temurin:21-jre .
 ```
+
+The images are published on GitHub Container Registry, e.g.
+`docker pull ghcr.io/dariacherepina/company-service:multi` (`:multi-jre` after the first
+push phase of the measurement script below).
 
 Inside the Dockerfiles each module is built with `mvn -f <service>/pom.xml`: the parent POM
 is used for inheritance only, so the other modules don't need to be in the build context.
@@ -366,7 +375,33 @@ is used for inheritance only, so the other modules don't need to be in the build
 | Variant | Contents | JVM flags |
 |---------|----------|-----------|
 | `Dockerfile` (single-stage) | Ubuntu + full JDK 21 + Maven + Maven repo + sources + JAR, runs as root | none (defaults) |
-| `Dockerfile.multistage` | Alpine + JRE 21 + JAR only, runs as user `app` | `JAVA_OPTS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=75"` |
+| `Dockerfile.multistage` → `:multi` | Alpine + JRE 21 + JAR only, runs as user `app` | `JAVA_OPTS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=75"` |
+| `Dockerfile.multistage` + `RUNTIME_IMAGE=eclipse-temurin:21-jre` → `:multi-jre` | Ubuntu + JRE 21 + JAR only, runs as user `app` | same |
+
+### Measuring the images (experiments 2.1 and 2.2)
+
+`experiments/container/measure-images.ps1` measures build time, image size, pull time and
+startup time for every service and variant and writes each value to
+`experiments/container/results/measurements-<time>.csv`, plus a summary (n, mean, sd, min, max).
+
+| Comparison | Shows |
+|------------|-------|
+| `single` vs `multi-jre` | effect of the multi-stage build alone (2.1) |
+| `multi-jre` vs `multi`  | effect of the Alpine base image alone (2.2) |
+
+```powershell
+.\experiments\container\measure-images.ps1 -Services report-service -Repeats 1   # quick test
+.\experiments\container\measure-images.ps1                                      # full run, 5 repeats
+.\experiments\container\measure-images.ps1 -Phases pull -Repeats 10             # one phase only
+```
+
+- **build** uses `--no-cache`; the base images are pulled once beforehand and not timed.
+- **push** needs `docker login ghcr.io` once.
+- **pull** deletes all experiment and base images before each pull, so every layer is downloaded.
+- **startup** starts one container at a time (512 MB limit) after an unrecorded warm-up start;
+  it records the time until `/actuator/health` is UP and `application_ready_time_seconds`.
+- Repeats are interleaved (run 1 of every image, then run 2, …) so network changes during the
+  session affect all variants equally.
 
 Measured (Docker 28, containerd image store):
 

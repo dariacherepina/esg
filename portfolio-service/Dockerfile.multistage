@@ -3,9 +3,15 @@
 #
 # Build from the repo root:
 #   docker build -f portfolio-service/Dockerfile.multistage -t portfolio-service:multi .
+#   docker build -f portfolio-service/Dockerfile.multistage -t portfolio-service:multi-jre --build-arg RUNTIME_IMAGE=eclipse-temurin:21-jre .
 #
 # JVM flags are set via JAVA_OPTS and can be switched off for the experiment:
 #   docker run -e JAVA_OPTS="" portfolio-service:multi
+
+# Runtime base image, switchable for the base-image experiment:
+#   eclipse-temurin:21-jre-alpine (default, Alpine/musl) or eclipse-temurin:21-jre (Ubuntu/glibc).
+# An ARG before the first FROM can be used in any FROM line.
+ARG RUNTIME_IMAGE=eclipse-temurin:21-jre-alpine
 
 # ---------- Stage 1: build ----------
 FROM maven:3.9-eclipse-temurin-21 AS build
@@ -24,10 +30,11 @@ COPY portfolio-service/src ./portfolio-service/src
 RUN mvn -B -q -f portfolio-service/pom.xml package -DskipTests
 
 # ---------- Stage 2: runtime ----------
-FROM eclipse-temurin:21-jre-alpine
+FROM ${RUNTIME_IMAGE}
 
-# Do not run as root inside the container
-RUN addgroup -S app && adduser -S app -G app
+# Do not run as root inside the container. Alpine (BusyBox) and Ubuntu name the tools differently.
+RUN if [ -f /etc/alpine-release ]; then addgroup -S app && adduser -S app -G app; \
+    else groupadd --system app && useradd --system --gid app app; fi
 USER app
 
 WORKDIR /app
