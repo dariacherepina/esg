@@ -44,6 +44,23 @@ services:
       - "8080:8080"   # http://localhost:8080
     extra_hosts:
       - "host.docker.internal:host-gateway"
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: esg-prometheus
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+  grafana:
+    image: grafana/grafana:latest
+    container_name: esg-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    depends_on:
+      - prometheus
 
 volumes:
   postgres-data:
+
