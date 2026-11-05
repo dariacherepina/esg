@@ -1,3 +1,14 @@
+# The whole platform: infrastructure + the four microservices on one Docker network.
+#
+#   docker compose up -d --build          everything (services built from Dockerfile.multistage)
+#   docker compose up -d postgres rabbitmq   infrastructure only, for running the services as JARs
+#
+# Inside the network every container is reached by its service name (DNS from Docker):
+#   esg-score-service ──REST──► company-service
+#   esg-score-service ──RabbitMQ "score.updated"──► portfolio-service, report-service
+#   portfolio-service ──REST──► esg-score-service
+# The services wait for their dependencies to be healthy (depends_on: service_healthy).
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -31,8 +42,97 @@ services:
       timeout: 5s
       retries: 10
 
+  # ---------- Microservices ----------
+  # Same image as the experiments' :multi variant (multi-stage, Alpine JRE), 512 MB limit each.
+  # Healthy = /actuator/health reports UP (checked with BusyBox wget inside the container).
+
+  company-service:
+    build:
+      context: .
+      dockerfile: company-service/Dockerfile.multistage
+    container_name: esg-company-service
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/company_db
+    ports:
+      - "8081:8081"
+    mem_limit: 512m
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck: &service-health
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/actuator/health | grep -q UP"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
+  esg-score-service:
+    build:
+      context: .
+      dockerfile: esg-score-service/Dockerfile.multistage
+    container_name: esg-score-service
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/score_db
+      RABBITMQ_HOST: rabbitmq
+      COMPANY_SERVICE_URL: http://company-service:8081
+    ports:
+      - "8082:8082"
+    mem_limit: 512m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      company-service:
+        condition: service_healthy
+    healthcheck:
+      <<: *service-health
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8082/actuator/health | grep -q UP"]
+
+  portfolio-service:
+    build:
+      context: .
+      dockerfile: portfolio-service/Dockerfile.multistage
+    container_name: esg-portfolio-service
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/portfolio_db
+      RABBITMQ_HOST: rabbitmq
+      SCORE_SERVICE_URL: http://esg-score-service:8082
+    ports:
+      - "8083:8083"
+    mem_limit: 512m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      esg-score-service:
+        condition: service_healthy
+    healthcheck:
+      <<: *service-health
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8083/actuator/health | grep -q UP"]
+
+  report-service:
+    build:
+      context: .
+      dockerfile: report-service/Dockerfile.multistage
+    container_name: esg-report-service
+    environment:
+      RABBITMQ_HOST: rabbitmq
+    ports:
+      - "8084:8084"
+    mem_limit: 512m
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      <<: *service-health
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8084/actuator/health | grep -q UP"]
+
+  # ---------- Optional ----------
+
   # Web UI — only started on request: docker compose --profile ui up -d
-  # Not part of the experiments. Forwards /api/... to the services running on the host.
+  # Not part of the experiments. nginx forwards /api/... to the service containers.
   frontend:
     profiles: ["ui"]
     build:
@@ -40,17 +140,31 @@ services:
       dockerfile: frontend/Dockerfile
     image: esg-frontend
     container_name: esg-frontend
+    environment:
+      COMPANY_SERVICE_URL: http://company-service:8081
+      SCORE_SERVICE_URL: http://esg-score-service:8082
+      PORTFOLIO_SERVICE_URL: http://portfolio-service:8083
+      REPORT_SERVICE_URL: http://report-service:8084
     ports:
       - "8080:8080"   # http://localhost:8080
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    depends_on:
+      company-service:
+        condition: service_healthy
+      esg-score-service:
+        condition: service_healthy
+      portfolio-service:
+        condition: service_healthy
+      report-service:
+        condition: service_healthy
+
   prometheus:
     image: prom/prometheus:latest
     container_name: esg-prometheus
     volumes:
-      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
       - "9090:9090"
+
   grafana:
     image: grafana/grafana:latest
     container_name: esg-grafana
@@ -63,4 +177,3 @@ services:
 
 volumes:
   postgres-data:
-

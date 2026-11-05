@@ -19,6 +19,41 @@ optimisation, CI pipeline caching).
 | portfolio-service | 8083 | `portfolio_db` | portfolios with weighted aggregate score, consumes `score.updated` | ✅ |
 | report-service | 8084 | — (in memory) | sustainability reports with rating + recommendations, consumes `score.updated` | ✅ |
 
+## Architecture
+
+The services talk to each other synchronously over REST and asynchronously over RabbitMQ:
+
+```
+                    REST: GET /api/companies
+   company-service ◄────────────────────────── esg-score-service
+     │ company_db                                 │ score_db
+     │                                            │ publishes score.updated
+     │                                            ▼
+     │                               RabbitMQ  exchange esg.events (topic)
+     │                                   │                       │
+     │                     queue (portfolio)               queue (report)
+     │                                   ▼                       ▼
+     │                         portfolio-service          report-service
+     │                           │ portfolio_db             (in memory)
+     │                           │
+     │                           └── REST: GET /api/scores ──► esg-score-service
+     ▼
+  PostgreSQL (one server, one database per service)
+```
+
+1. `POST /api/scores` on esg-score-service fetches the raw ESG data from **company-service**
+   (REST), calculates the scores and stores them.
+2. For every score it publishes a **`score.updated` event** to RabbitMQ.
+3. **portfolio-service** and **report-service** each receive the event on their own queue:
+   portfolios recompute their aggregate score, reports are regenerated. Neither is called
+   directly by the score service, so it does not need to know them (loose coupling).
+4. portfolio-service also calls esg-score-service over REST when a portfolio is created or
+   updated, to fill in the current scores of its holdings.
+
+In Docker Compose all services share one network and reach each other **by service name**
+(`http://company-service:8081`, `rabbitmq`, `postgres`). Each service waits until its
+dependencies report healthy before it starts.
+
 
 ## Prerequisites
 
@@ -30,8 +65,24 @@ optimisation, CI pipeline caching).
 
 All commands are run from the repository root.
 
+### Option A — everything in Docker (recommended)
+
 ```powershell
-docker compose up -d                                          # Postgres + RabbitMQ
+docker compose up -d --build --wait     # infrastructure + all four services
+docker compose ps                       # every service: Up ... (healthy)
+```
+
+Compose builds the four services from their `Dockerfile.multistage`, starts them in
+dependency order (Postgres/RabbitMQ → company → score → portfolio; report after RabbitMQ)
+and `--wait` returns once all are healthy. The first build downloads the Maven dependencies
+and takes a few minutes; `--build` is only needed again after code changes.
+
+Logs of one service: `docker compose logs -f esg-score-service`.
+
+### Option B — services as JARs on the host (for development)
+
+```powershell
+docker compose up -d postgres rabbitmq                        # infrastructure only
 mvn package -DskipTests                                       # all services
 
 # one terminal per service
@@ -41,7 +92,10 @@ java -jar portfolio-service/target/portfolio-service-0.0.1-SNAPSHOT.jar
 java -jar report-service/target/report-service-0.0.1-SNAPSHOT.jar
 ```
 
-Stop a service with `Ctrl+C`. RabbitMQ's management UI: <http://localhost:15672> (`esg` / `esg`).
+Stop a service with `Ctrl+C`. Don't mix A and B: both use ports 8081–8084.
+Prometheus and the web UI are set up for option A.
+
+RabbitMQ's management UI: <http://localhost:15672> (`esg` / `esg`).
 
 ### Web UI (optional)
 
@@ -57,9 +111,8 @@ portfolios with their aggregate scores. It refreshes every 5 seconds — press
 Links like `http://localhost:8080/#company=6` open a company directly.
 
 The UI is plain HTML/CSS/JS in [frontend/](frontend/), served by nginx, which also forwards
-`/api/...` to the four services (so no CORS setup is needed). It is **not** one of the measured
-services and only starts with `--profile ui`. When the services run as containers, point
-nginx at them with `-e COMPANY_SERVICE_URL=http://cs:8081` etc.
+`/api/...` to the four service containers (so no CORS setup is needed). It is **not** one of
+the measured services and only starts with `--profile ui`, after the four services are healthy.
 
 ## Verifying the setup
 
@@ -69,8 +122,9 @@ nginx at them with `-e COMPANY_SERVICE_URL=http://cs:8081` etc.
 docker compose ps
 ```
 
-Both `esg-postgres` and `esg-rabbitmq` should read `Up ... (healthy)`. Right after starting it
-may show `(health: starting)` for a few seconds — run the command again.
+`esg-postgres` and `esg-rabbitmq` (and with option A the four service containers) should read
+`Up ... (healthy)`. Right after starting it may show `(health: starting)` for a few seconds —
+run the command again.
 
 If you see `error during connect ... dockerDesktopLinuxEngine`, Docker Desktop is not running.
 
@@ -426,28 +480,13 @@ than for a single service because all four JVMs start at once and compete for CP
 > compressed and unpacked sizes together (e.g. 1.16 GB / 399 MB). Use the compressed size
 > for pull-time comparisons: `docker image inspect company-service:multi --format '{{.Size}}'`
 
-Run the services as containers against the compose infrastructure. Inside Docker, other
-containers are reached by **container name**, not `localhost`:
+`docker compose up` runs the services from the multi-stage images (Alpine, 512 MB limit each,
+see `docker-compose.yml`). Inside the Compose network the containers reach each other by
+**service name**, not `localhost`: e.g. `COMPANY_SERVICE_URL=http://company-service:8081`,
+`DB_URL=jdbc:postgresql://postgres:5432/company_db`, `RABBITMQ_HOST=rabbitmq`.
 
-```powershell
-docker run -d --name cs --network esg_default --memory=512m -p 18081:8081 `
-  -e DB_URL=jdbc:postgresql://esg-postgres:5432/company_db company-service:multi
-
-docker run -d --name ss --network esg_default --memory=512m -p 18082:8082 `
-  -e DB_URL=jdbc:postgresql://esg-postgres:5432/score_db `
-  -e RABBITMQ_HOST=esg-rabbitmq -e COMPANY_SERVICE_URL=http://cs:8081 esg-score-service:multi
-
-docker run -d --name ps --network esg_default --memory=512m -p 18083:8083 `
-  -e DB_URL=jdbc:postgresql://esg-postgres:5432/portfolio_db `
-  -e RABBITMQ_HOST=esg-rabbitmq -e SCORE_SERVICE_URL=http://ss:8082 portfolio-service:multi
-
-docker run -d --name rs --network esg_default --memory=512m -p 18084:8084 `
-  -e RABBITMQ_HOST=esg-rabbitmq report-service:multi
-
-docker rm -f cs ss ps rs   # stop and remove
-```
-
-Switch the JVM flags off for the experiment with `-e JAVA_OPTS=`.
+To switch the JVM flags off for an experiment, add `JAVA_OPTS: ""` to a service's
+`environment:` in `docker-compose.yml` and run `docker compose up -d` again.
 
 ## Seed data
 
@@ -497,6 +536,6 @@ If port 5432 is already taken by a local Postgres installation, change the mappi
 
 | Command                  | Effect                                              |
 |--------------------------|-----------------------------------------------------|
-| `docker compose stop`    | stops Postgres + RabbitMQ, keeps containers and data |
+| `docker compose stop`    | stops all containers, keeps containers and data     |
 | `docker compose down`    | removes the containers, keeps data                  |
 | `docker compose down -v` | removes containers **and data** (full reset)        |
