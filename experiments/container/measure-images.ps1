@@ -65,6 +65,9 @@ param(
     [string] $OutDir = (Join-Path $PSScriptRoot 'results')
 )
 
+# Docker writes notices to stderr; with 'Stop' (GitHub Actions default) Windows PowerShell would treat them as fatal.
+$ErrorActionPreference = 'Continue'
+
 $allServices = 'company-service', 'esg-score-service', 'portfolio-service', 'report-service'
 $allVariants = 'single', 'multi-jdk', 'multi-jre', 'multi'
 # Pinned base images (tag for humans, digest for Docker): identical images on every run and machine.
@@ -297,6 +300,7 @@ try {
                 $sw.Stop()
                 if ($LASTEXITCODE -ne 0) { Write-Warning "build failed: $s $v run $r"; continue }
                 Write-Result 'build_time' $s $v $r $sw.Elapsed.TotalSeconds 's'
+                docker builder prune -af 2>$null | Out-Null   # disk space: --no-cache never reuses it; the image itself is kept
             } }
         }
     }
@@ -366,8 +370,8 @@ try {
                 $file = "$s/Dockerfile.$v"
                 $tag = "${s}:$v"
 
-                # S1: cold - no layer cache (--no-cache) and an empty cache mount (--no-cache keeps mounts)
-                docker builder prune -f --filter type=exec.cachemount 2>$null | Out-Null
+                # S1: cold - whole build cache deleted (layers and cache mount, also frees disk space), then --no-cache
+                docker builder prune -af 2>$null | Out-Null
                 $sw = [Diagnostics.Stopwatch]::StartNew()
                 docker build --no-cache -q -f $file -t $tag . | Out-Null
                 $sw.Stop()
@@ -399,7 +403,7 @@ try {
                 }
             } }
         }
-        docker builder prune -f --filter type=exec.cachemount 2>$null | Out-Null   # leave no warm mount behind
+        docker builder prune -af 2>$null | Out-Null   # leave no warm cache or mount behind, free disk space
     }
     if ($Phases -contains 'load') {
         $s = 'esg-score-service'   # the load test targets this service only

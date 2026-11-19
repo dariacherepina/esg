@@ -1,0 +1,129 @@
+name: Container experiments
+
+# Started by hand only (Actions -> Container experiments -> Run workflow); runs on the self-hosted thesis laptop.
+on:
+  workflow_dispatch:
+    inputs:
+      study:
+        description: "test = short trial run; study1 = Measurement Study 1; exp2 = Experiment 2"
+        type: choice
+        options: [test, study1, exp2]
+        default: test
+      repeats:
+        description: "Runs per variant (study1 and exp2)"
+        type: number
+        default: 5
+
+# Never two measurements at the same time on the laptop.
+concurrency:
+  group: thesis-laptop
+  cancel-in-progress: false
+
+env:
+  K6_VERSION: v2.4.0
+  K6_SHA256: aaa90b3afc336faf90172c7addf45c4f41305f6f188e3d564f79466e80ac68e3
+  MIN_FREE_GB: 15
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  measure:
+    runs-on: [self-hosted, thesis-laptop]
+    timeout-minutes: 1440
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check preconditions (disk space, no other containers)
+        run: |
+          $free = [math]::Round((Get-PSDrive C).Free / 1GB, 1)
+          Write-Host "Free disk space on C: $free GB"
+          if ($free -lt $env:MIN_FREE_GB) { throw "Only $free GB free, need $env:MIN_FREE_GB GB - run 'docker image prune -a' and 'docker builder prune -a'" }
+          $allowed = 'esg-postgres', 'esg-rabbitmq', 'esg-company-service', 'esg-registry'
+          $others = @(docker ps --format '{{.Names}}' | Where-Object { $allowed -notcontains $_ })
+          if ($others.Count -gt 0) { throw "Other containers are running and would distort the measurement: $($others -join ', ') - stop them first" }
+
+      - name: Download k6 (pinned version, checksum verified)
+        run: |
+          $dir = 'experiments\container\tools'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
+          $zip = Join-Path $env:RUNNER_TEMP 'k6.zip'
+          Invoke-WebRequest "https://github.com/grafana/k6/releases/download/$env:K6_VERSION/k6-$env:K6_VERSION-windows-amd64.zip" -OutFile $zip -UseBasicParsing
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:K6_SHA256) { throw "k6 checksum mismatch: $hash" }
+          $x = Join-Path $env:RUNNER_TEMP 'k6'
+          Expand-Archive $zip -DestinationPath $x -Force
+          Copy-Item (Get-ChildItem $x -Recurse -Filter k6.exe).FullName $dir -Force
+          & "$dir\k6.exe" version
+
+      - name: Record environment
+        run: |
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Force results | Out-Null
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          @(
+            "date:        $((Get-Date).ToUniversalTime().ToString('s'))Z"
+            "study:       ${{ inputs.study }} (repeats ${{ inputs.repeats }})"
+            "commit:      $env:GITHUB_SHA"
+            "windows:     $($os.Caption) $($os.Version)"
+            "cpu:         $($cpu.Name) ($($cpu.NumberOfCores) cores, $($cpu.NumberOfLogicalProcessors) threads)"
+            "ram:         $([math]::Round($os.TotalVisibleMemorySize / 1MB, 1)) GB"
+            "docker:      $(docker version --format '{{.Server.Platform.Name}}, engine {{.Server.Version}}')"
+            "docker vm:   $(docker info --format '{{.NCPU}} CPUs, {{.MemTotal}} bytes memory, kernel {{.KernelVersion}}')"
+            "compose:     $(docker compose version --short)"
+            "python:      $(python --version 2>&1)"
+            "scipy:       $(python -c 'import scipy; print(scipy.__version__)')"
+            "k6:          $(& experiments\container\tools\k6.exe version)"
+            "powershell:  $($PSVersionTable.PSVersion)"
+          ) | Tee-Object -FilePath results\environment.txt
+          exit 0
+
+      # Success criterion of every measure step: measurements were written (warnings for single runs stay in the log).
+      - name: Measure (short trial run)
+        if: inputs.study == 'test'
+        run: |
+          .\experiments\container\measure-images.ps1 -Services report-service -Phases build,size,startup,cache -Repeats 1 -Label test -OutDir results
+          .\experiments\container\measure-images.ps1 -Services esg-score-service -Variants multi -Phases build,load -Repeats 1 -LoadRepeats 1 -LoadDuration 15s -Label test-load -OutDir results
+          if (-not (Get-ChildItem results -Filter 'measurements-*.csv')) { throw 'No measurements were written' }
+          exit 0
+
+      - name: Measure (Measurement Study 1)
+        if: inputs.study == 'study1'
+        run: |
+          .\experiments\container\measure-images.ps1 -Phases build,size,startup,load -Repeats ${{ inputs.repeats }} -LoadRepeats ${{ inputs.repeats }} -Label study1 -OutDir results
+          if (-not (Get-ChildItem results -Filter 'measurements-*.csv')) { throw 'No measurements were written' }
+          exit 0
+
+      - name: Measure (Experiment 2)
+        if: inputs.study == 'exp2'
+        run: |
+          .\experiments\container\measure-images.ps1 -Services report-service,esg-score-service -Phases cache -Repeats ${{ inputs.repeats }} -Label exp2 -OutDir results
+          if (-not (Get-ChildItem results -Filter 'measurements-*.csv')) { throw 'No measurements were written' }
+          exit 0
+
+      - name: Statistical analysis
+        if: always()
+        run: |
+          if (-not (Get-ChildItem results -Filter 'measurements-*.csv')) { Write-Warning 'No measurements to analyse'; exit 0 }
+          python experiments\analysis\analyze.py results --out results\report
+          if ($LASTEXITCODE -ne 0) { throw 'analyze.py failed' }
+          Get-Content results\report\report.md -Encoding UTF8 | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          exit 0
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: results-${{ inputs.study }}-${{ github.run_number }}
+          path: results/
+
+      - name: Stop experiment containers
+        if: always()
+        run: |
+          $ErrorActionPreference = 'Continue'
+          docker rm -f esg-startup-test esg-registry 2>$null | Out-Null
+          docker compose down 2>$null | Out-Null
+          exit 0

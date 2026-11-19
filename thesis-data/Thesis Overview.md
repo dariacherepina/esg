@@ -6,19 +6,16 @@
 
 **Abstract**
 
-This thesis presents a controlled empirical study of four Dockerfile variants — a single-stage build, and multi-stage builds with a JDK on Ubuntu, a JRE on Ubuntu, and a JRE on Alpine Linux — applied uniformly to a self-developed system of four Spring Boot microservices. Five metrics are measured: image size, build time, container startup time, runtime memory (at idle and peak under load), and application throughput with p99 latency under sustained load. Additionally, Experiment 2 isolates the effect of build caching on rebuild time in a 2×2 design: instruction ordering (cache-optimal vs. cache-suboptimal) combined with and without a BuildKit cache mount for the Maven repository, measured for a cold build, a rebuild on a reused build machine, and an incremental rebuild after a source change.
+This thesis presents a controlled empirical study of four Dockerfile variants — a single-stage build, and multi-stage builds with a JDK on Ubuntu, a JRE on Ubuntu, and a JRE on Alpine Linux — applied uniformly to a self-developed system of four Spring Boot microservices. Five metrics are measured: image size, build time, container startup time, runtime memory (at idle and peak under load), and application throughput with p99 latency under sustained load. Additionally, Experiment 2 isolates the effect of build caching on rebuild time in a 2×2 design: instruction ordering (cache-optimal vs. cache-suboptimal) combined with and without a BuildKit cache mount for the Maven repository, measured for a cold build, a rebuild on a reused build machine, and an incremental rebuild after a source change. A supplementary experiment examines how far these caching results generalize to ephemeral GitHub-hosted runners with a remote cache backend.
 
-## Motivation & Research Framework
+## Motivation 
+Docker has become the standard for packaging and deploying microservices, and with it comes a set of widely repeated recommendations: use multi-stage builds to keep images small, choose Alpine Linux as a minimal base image, and structure Dockerfiles to maximize cache reuse. This thesis documents the effect of these recommendations for a Java/Spring Boot system, measured across the metrics that matter in production: image size, build time, container startup time, runtime memory, and performance under load.
 
-Modern software systems increasingly rely on containerized microservice architectures. While Docker has become the de facto standard for packaging and deploying services, the resource footprint of container images — their size, build time, startup latency, and runtime memory — directly impacts infrastructure costs and energy consumption.
 
-Existing studies examine Dockerfile optimization on large heterogeneous OSS repositories or single-service Node.js applications. This thesis focuses on a different context: a controlled, homogeneous Java/Spring Boot microservice system. Java introduces specific characteristics that make this context worth studying separately.
+Multi-stage builds and minimal base images are a well-established approach to reducing image size. Fachrudin and Affandi (2025) demonstrate that combining Alpine with multi-stage builds reduces image size by up to 94% compared to a single-stage build, and Rosa et al. (2025) confirm that changing the base image has the most substantial impact on image size among all Dockerfile optimization patterns. For a Spring Boot application the gains are particularly large: the full Maven and JDK build image weighs roughly 700 MB, while the application itself is a fat JAR of 30–60 MB. However, Alpine packages musl libc rather than glibc, and the two differ in their memory allocator. Tjiong (2024) finds that Alpine-based containers consume more energy than expected from their size alone, attributing this to musl’s reduced functionality. This thesis measures how much image size each optimization step removes — stripping Maven, switching from JDK to JRE, switching from Ubuntu to Alpine — and whether the final Alpine image carries a cost in startup time, runtime memory, or throughput under load. 
 
-Spring Boot packages everything into a single fat JAR (about 29–62 MB for the four services of this system). The choice of base image therefore has a large proportional effect on final image size — shipping a full JDK and Maven image (about 700 MB uncompressed) to run a 60 MB JAR wastes most of the image. Multi-stage builds and minimal base images are particularly impactful here, and their effect on not just image size but also build time, startup time, runtime memory, and performance under load is not well understood in this specific context.
 
-The JVM also takes 3–8 seconds to start a Spring Boot application, making container startup time a meaningful and measurable metric — differences between image variants are large enough to observe and compare statistically.
-
-Beyond image composition, Docker build caching represents a second, largely independent optimization axis. In real development workflows, source code changes constantly while dependency definitions rarely do. If Dockerfile instructions are ordered incorrectly, every small source change triggers a full Maven dependency re-download — adding several minutes to every rebuild (in a preliminary measurement, resolving the dependencies of one service took about 260 s, compiling and packaging it about 3 s). Correct instruction ordering avoids this cost by keeping the dependency layer cached. BuildKit cache mounts offer a second mechanism: the Maven repository is kept on the build machine outside the image layers, so even a rebuilt layer finds its dependencies locally. This thesis quantifies how large these differences are and whether instruction ordering still matters when a cache mount is used.
+Development and CI/CD workflows, source code changes constantly while dependency definitions rarely do. If Dockerfile instructions are ordered so that source files and dependency files are copied together, any source change invalidates the dependency download layer. In a preliminary measurement on this system, resolving Maven dependencies took approximately 260 seconds per service; compiling and packaging the source took approximately 3 seconds. Correct instruction ordering avoids this by keeping the dependency layer cached across source changes. BuildKit cache mounts offer a second mechanism, persisting the Maven repository on the build machine across builds regardless of layer invalidation. This thesis measures the actual rebuild cost of wrong instruction ordering, whether a cache mount eliminates that cost, and whether ordering still matters when a mount is in use. 
 
 ## Research Questions
 
@@ -124,11 +121,46 @@ The scenarios increase step by step in what is cached: nothing (S1), only the ca
 
 5 runs per variant per scenario → Shapiro-Wilk → Kruskal-Wallis across the four variants → pairwise Mann-Whitney U with Bonferroni correction (α = 0.05).
 
+Services: Experiment 2 examines a caching mechanism that is independent of the application code; its effect size depends on the volume of resolved dependencies. It is therefore measured on the services with the smallest (report-service: no database stack) and the largest dependency set (esg-score-service: database stack and RabbitMQ, about 252 MB of resolved artifacts). The other two services share almost the same dependency set as esg-score-service.
+
 The cache mount is shared by all builds on a machine by default, so it is cleared between variants where a measurement requires it, to prevent one variant from warming it for another. Its benefit only applies to reused build machines such as the self-hosted runner of this study; on ephemeral CI runners the mount is empty on every build. The cache-optimal ordering follows the widespread pattern of resolving dependencies in a separate layer via `mvn dependency:go-offline` [citation: Docker documentation]; cache mounts are described in [citation: Docker BuildKit documentation].
+
+### Supplementary Experiment 3 — Cache Backends on Hosted Runners (Generalizability)
+
+Experiment 2 runs on a persistent self-hosted runner, where the layer cache survives between builds. Without a further test, a reader could assume that its results transfer to any CI setup. This supplementary experiment bounds that claim: it examines whether a correctly ordered Dockerfile still benefits from caching on ephemeral GitHub-hosted runners, where every job starts on a fresh machine and the cache has to be exported to and imported from a remote backend. It is reported under threats to validity / generalizability, not as a separate research question, and is carried out after the main measurements.
+
+- Question: How much of the caching benefit of a correctly ordered multi-stage Dockerfile is retained on ephemeral hosted runners with a remote cache backend (GitHub Actions cache), compared with a persistent local cache?
+- Independent variable: Cache configuration (runner type and cache backend)
+- Dockerfile: `Dockerfile.cache-right` of one service only (constant across all configurations)
+- Measurements: cold build time and warm build time after a src/-only change (seconds), size of the exported cache entry (MB)
+
+| Configuration | Runner | Cache flags | Hypothesis (cold) | Hypothesis (warm, src/ change) |
+|---|---|---|---|---|
+| A — no cache | GitHub-hosted | none | baseline | same as cold |
+| B — gha `mode=min` | GitHub-hosted | `--cache-to=type=gha,mode=min --cache-from=type=gha` | slower than A (export overhead) | no improvement: `mode=min` exports only the layers of the final image, so the dependency layer of the build stage is not cached |
+| C — gha `mode=max` | GitHub-hosted | `--cache-to=type=gha,mode=max --cache-from=type=gha` | slower than A (export overhead) | faster than cold: all stages are exported, so the dependency layer is restored from the remote cache |
+| D — local persistent | self-hosted laptop | none (local layer cache) | – | fast; taken from Experiment 2 (`cache-right`, S1 as cold, S3 as warm) |
+
+Hypotheses:
+- H1: Correct instruction ordering is necessary but not sufficient on ephemeral runners: the same `cache-right` Dockerfile yields no speed-up without a remote cache (A) and with `mode=min` (B).
+- H2: `mode=min` gives no benefit for multi-stage builds although the workflow runs without errors and a cache entry is created. Docker's documentation states that `mode=min` exports only the layers of the resulting image; the experiment shows the practical effect with measured numbers.
+- H3: A persistent local cache (D) gives a larger relative speed-up than a remote cache backend (C).
+
+Design decisions:
+- **Comparison by relative speed-up, not absolute time.** D runs on the laptop, A–C on GitHub-hosted virtual machines, which differ in CPU, memory and network (the Maven download is expected to be much faster in a data centre). Absolute build times are therefore not comparable across runner types; each configuration is evaluated by its warm/cold ratio on its own machine.
+- **Cold and warm as two jobs in one workflow run.** Job 1 builds cold and exports the cache; job 2 starts on a new machine, applies the src/ change inside the job (appending a unique comment to a `.java` file, as in Experiment 2) and builds warm. No experiment commits are pushed to the repository.
+- **A unique cache scope per workflow run** (`scope=run-${{ github.run_id }}`), so every cold build starts with an empty remote cache and runs cannot influence each other; cache entries are not deleted by hand.
+- **5 runs per configuration and scenario**, as in the rest of the study (with 3 runs, a Mann-Whitney U test cannot reach p < 0.05).
+- Build time includes cache import and export, because that is the cost a developer experiences.
+- The cache entry size is measured, not predicted; it shows whether `mode=min` exported only the final stage.
+
+Analysis: per configuration, cold vs. warm with Mann-Whitney U and the median speed-up (cold/warm); across configurations, the speed-ups are compared descriptively. Results are phrased as "shows" for this system and setup, not as general proof.
+
+Limitations: one service and one Dockerfile; GitHub-hosted runner hardware is not controlled and may vary between jobs; the GitHub Actions cache service has its own size limits and network performance; BuildKit cache mounts (Experiment 2, S2) are not restored on hosted runners and are not part of this experiment.
 
 ## Reproducibility & CI/CD
 
-Both Measurement Study 1 and Experiment 2 are executed via a GitHub Actions workflow running on a self-hosted runner registered to the thesis repository. The self-hosted runner is a dedicated laptop (Windows 11 Home, Docker Desktop) on which no other workloads run during measurement. All jobs run sequentially on this machine. The host values of the runner are recorded before the final runs.
+Both Measurement Study 1 and Experiment 2 are executed via a GitHub Actions workflow running on a self-hosted runner registered to the thesis repository. The self-hosted runner is the author's laptop (Windows 11 Home, Docker Desktop), used exclusively for the measurements while they run: other containers are stopped (the workflow refuses to start otherwise) and no other applications run. All jobs run sequentially on this machine (`.github/workflows/experiments.yml`, started by hand). Measurement Study 1 and Experiment 2 run as separate workflow runs. Each run records the host environment (Windows, CPU, RAM, Docker, tool versions) in `environment.txt` next to the measurements. The build cache is pruned automatically at points where it is not reused, because the laptop has limited disk space. Only the supplementary Experiment 3 (configurations A–C) runs on GitHub-hosted runners (`ubuntu-latest`), in a separate workflow.
 
 **Infrastructure:**
 
