@@ -479,7 +479,7 @@ docker history company-service:multi
 Run the multi image with a memory limit, connected to the compose Postgres:
 
 ```powershell
-docker run --rm -d --name cs --network esg_default --memory=512m -p 18081:8081 `
+docker run --rm -d --name cs --network esg-net --memory=512m -p 18081:8081 `
   -e DB_URL=jdbc:postgresql://esg-postgres:5432/company_db company-service:multi
 docker exec cs sh -c 'java $JAVA_OPTS -XX:+PrintFlagsFinal -version 2>/dev/null | grep -E " MaxHeapSize | MaxRAMPercentage "'
 docker exec cs whoami
@@ -487,7 +487,7 @@ docker rm -f cs
 ```
 
 Note: inside the container the database host is `esg-postgres` (the container name on the
-compose network `esg_default`), not `localhost` — `localhost` inside a container is the
+compose network `esg-net`), not `localhost` — `localhost` inside a container is the
 container itself.
 
 **Look for:** `MaxHeapSize` ≈ 384 MB and `MaxRAMPercentage = 75`; user `app`, not `root`.

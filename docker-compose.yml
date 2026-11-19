@@ -11,7 +11,7 @@
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16.15-alpine
     container_name: esg-postgres
     environment:
       POSTGRES_USER: esg
@@ -28,7 +28,7 @@ services:
       retries: 10
 
   rabbitmq:
-    image: rabbitmq:4.1-management-alpine
+    image: rabbitmq:4.1.8-management-alpine
     container_name: esg-rabbitmq
     environment:
       RABBITMQ_DEFAULT_USER: esg
@@ -158,7 +158,7 @@ services:
         condition: service_healthy
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.16.0
     container_name: esg-prometheus
     volumes:
       - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
@@ -166,7 +166,7 @@ services:
       - "9090:9090"
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:13.3.0
     container_name: esg-grafana
     ports:
       - "3000:3000"
@@ -177,3 +177,6 @@ services:
 
 volumes:
   postgres-data:
+networks:
+  default:
+    name: esg-net

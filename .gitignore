@@ -3,3 +3,6 @@ target/
 .idea/
 *.iml
 .vscode/
+
+# Python bytecode (experiments/analysis)
+__pycache__/
