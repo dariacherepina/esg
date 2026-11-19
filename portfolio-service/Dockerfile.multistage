@@ -20,9 +20,9 @@ RUN mvn -B -q -f portfolio-service/pom.xml package -DskipTests
 FROM ${RUNTIME_IMAGE}
 
 # Do not run as root inside the container. Alpine (BusyBox) and Ubuntu name the tools differently.
-RUN if [ -f /etc/alpine-release ]; then addgroup -S app && adduser -S app -G app; \
-    else groupadd --system app && useradd --system --gid app app; fi
-USER app
+RUN if [ -f /etc/alpine-release ]; then addgroup -S -g 10001 app && adduser -S -u 10001 -G app app; \
+    else groupadd --system --gid 10001 app && useradd --system --uid 10001 --gid app app; fi
+USER 10001:10001
 
 WORKDIR /app
 COPY --from=build /build/portfolio-service/target/portfolio-service-0.0.1-SNAPSHOT.jar app.jar

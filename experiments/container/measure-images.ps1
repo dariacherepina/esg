@@ -10,7 +10,7 @@
     multi-jre  Dockerfile.multistage  runtime eclipse-temurin:21.0.13_9-jre  multi-jdk vs multi-jre = JDK -> JRE
     multi      Dockerfile.multistage  runtime ...:21.0.13_9-jre-alpine       multi-jre vs multi     = Ubuntu -> Alpine
 
-  Phases (run in this order, each can be run on its own with -Phases):
+  Phases (run in this order, each can be run on its own with -Phases; push and pull are not in the default):
     build    docker build --no-cache, timed. Base images are pulled once beforehand and not timed.
     size     compressed size (layer sizes in a local registry = what a pull transfers) and
              uncompressed size (sum of layers), in MB (10^6 bytes)
@@ -23,6 +23,7 @@
              Every variant runs with the same JVM flags (-JvmFlags). Warm-up runs are not recorded.
     cache    experiment 2: Dockerfile.cache-right vs Dockerfile.cache-wrong per service.
              S1 = cold build (--no-cache), S2 = rebuild after one .java file changed (then restored).
+    load     k6 load test against esg-score-service: throughput, p99 latency, peak memory.
 
   Repeats are interleaved (run 1 of every image, then run 2, ...) so that network or machine
   load changes during the session spread over all variants instead of hitting one.
@@ -31,7 +32,7 @@
   # quick test: one service, one run each (about 5 min)
   .\experiments\container\measure-images.ps1 -Services report-service -Repeats 1
 .EXAMPLE
-  # full run: 4 services x 3 variants x 5 repeats
+  # full run: 4 services x 4 variants x 5 repeats, experiment 2 and the load test
   .\experiments\container\measure-images.ps1
 .EXAMPLE
   # repeat only the pull measurement, 10 runs
@@ -45,7 +46,7 @@ param(
     [string[]] $Variants = @('single', 'multi-jdk', 'multi-jre', 'multi'),
 
     [ValidateSet('build', 'size', 'push', 'pull', 'startup', 'cache', 'load')]
-    [string[]] $Phases = @('build', 'size', 'push', 'pull', 'startup', 'load'),
+    [string[]] $Phases = @('build', 'size', 'startup', 'load', 'cache'),
 
     [int] $Repeats = 5,
     [int] $StartupWarmup = 1,

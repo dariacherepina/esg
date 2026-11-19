@@ -1,0 +1,50 @@
+# Hadolint report: before fixes
+date:     2026-11-19T12:56:29Z
+commit:   fb1316f
+tool:     Haskell Dockerfile Linter 2.15.1 (hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d)
+command:  hadolint --no-color - < <Dockerfile>   (default rules, no config file)
+files:    17
+
+## Findings per file
+company-service/Dockerfile
+  no findings
+company-service/Dockerfile.cache-right
+  company-service/Dockerfile.cache-right:13 DL3066 info: Non-numeric user-id may not be resolvable by host system
+company-service/Dockerfile.cache-wrong
+  company-service/Dockerfile.cache-wrong:8 DL3059 info: Multiple consecutive `RUN` instructions. Consider consolidation.
+  company-service/Dockerfile.cache-wrong:12 DL3066 info: Non-numeric user-id may not be resolvable by host system
+company-service/Dockerfile.multistage
+  company-service/Dockerfile.multistage:18 DL3066 info: Non-numeric user-id may not be resolvable by host system
+esg-score-service/Dockerfile
+  no findings
+esg-score-service/Dockerfile.cache-right
+  esg-score-service/Dockerfile.cache-right:13 DL3066 info: Non-numeric user-id may not be resolvable by host system
+esg-score-service/Dockerfile.cache-wrong
+  esg-score-service/Dockerfile.cache-wrong:8 DL3059 info: Multiple consecutive `RUN` instructions. Consider consolidation.
+  esg-score-service/Dockerfile.cache-wrong:12 DL3066 info: Non-numeric user-id may not be resolvable by host system
+esg-score-service/Dockerfile.multistage
+  esg-score-service/Dockerfile.multistage:20 DL3066 info: Non-numeric user-id may not be resolvable by host system
+frontend/Dockerfile
+  no findings
+portfolio-service/Dockerfile
+  no findings
+portfolio-service/Dockerfile.cache-right
+  portfolio-service/Dockerfile.cache-right:13 DL3066 info: Non-numeric user-id may not be resolvable by host system
+portfolio-service/Dockerfile.cache-wrong
+  portfolio-service/Dockerfile.cache-wrong:8 DL3059 info: Multiple consecutive `RUN` instructions. Consider consolidation.
+  portfolio-service/Dockerfile.cache-wrong:12 DL3066 info: Non-numeric user-id may not be resolvable by host system
+portfolio-service/Dockerfile.multistage
+  portfolio-service/Dockerfile.multistage:25 DL3066 info: Non-numeric user-id may not be resolvable by host system
+report-service/Dockerfile
+  no findings
+report-service/Dockerfile.cache-right
+  report-service/Dockerfile.cache-right:13 DL3066 info: Non-numeric user-id may not be resolvable by host system
+report-service/Dockerfile.cache-wrong
+  report-service/Dockerfile.cache-wrong:8 DL3059 info: Multiple consecutive `RUN` instructions. Consider consolidation.
+  report-service/Dockerfile.cache-wrong:12 DL3066 info: Non-numeric user-id may not be resolvable by host system
+report-service/Dockerfile.multistage
+  report-service/Dockerfile.multistage:21 DL3066 info: Non-numeric user-id may not be resolvable by host system
+
+## Summary per rule
+  4 DL3059 info: Multiple consecutive `RUN` instructions. Consider consolidation.
+  12 DL3066 info: Non-numeric user-id may not be resolvable by host system
