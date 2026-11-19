@@ -9,7 +9,9 @@ FROM maven:3.9.16-eclipse-temurin-21@sha256:99e61abcff91a9b1333463bd8451fb18495d
 
 WORKDIR /build
 COPY pom.xml .
-COPY report-service ./report-service
+COPY report-service/pom.xml ./report-service/
+RUN mvn -B -q -f report-service/pom.xml dependency:go-offline
+COPY report-service/src ./report-service/src
 
 # -f builds the module via its own POM; the parent is read only for inheritance, so the other
 # modules listed in the root POM don't need to be in the build context.

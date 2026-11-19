@@ -6,7 +6,7 @@
 
 **Abstract**
 
-This thesis presents a controlled empirical study of four Dockerfile variants — a single-stage build, and multi-stage builds with a JDK on Ubuntu, a JRE on Ubuntu, and a JRE on Alpine Linux — applied uniformly to a self-developed system of four Spring Boot microservices. Five metrics are measured: image size, build time, container startup time, runtime memory (at idle and peak under load), and application throughput with p99 latency under sustained load. Additionally, Experiment 2 isolates the effect of build caching on rebuild time in a 2×2 design: instruction ordering (cache-optimal vs. cache-suboptimal) combined with and without a BuildKit cache mount for the Maven repository, measured for a cold build, an incremental rebuild after a source change, and a rebuild on a reused build machine.
+This thesis presents a controlled empirical study of four Dockerfile variants — a single-stage build, and multi-stage builds with a JDK on Ubuntu, a JRE on Ubuntu, and a JRE on Alpine Linux — applied uniformly to a self-developed system of four Spring Boot microservices. Five metrics are measured: image size, build time, container startup time, runtime memory (at idle and peak under load), and application throughput with p99 latency under sustained load. Additionally, Experiment 2 isolates the effect of build caching on rebuild time in a 2×2 design: instruction ordering (cache-optimal vs. cache-suboptimal) combined with and without a BuildKit cache mount for the Maven repository, measured for a cold build, a rebuild on a reused build machine, and an incremental rebuild after a source change.
 
 ## Motivation & Research Framework
 
@@ -24,7 +24,7 @@ Beyond image composition, Docker build caching represents a second, largely inde
 
 RQ1 - How do multi-stage builds and base image selection affect image size, build time, container startup time, runtime memory, and throughput with p99 latency under load in a homogeneous Java/Spring Boot microservice system?
 
-RQ2 - How do instruction ordering and BuildKit cache mounts in a multi-stage Dockerfile affect Docker build cache reuse and rebuild time, for an incremental rebuild after a source-only change and for a rebuild on a reused build machine?
+RQ2 - How do instruction ordering and BuildKit cache mounts in a multi-stage Dockerfile affect Docker build cache reuse and rebuild time, for a rebuild on a reused build machine and for an incremental rebuild after a source-only change?
 
 ## Research Focus
 
@@ -94,7 +94,7 @@ Known limitations:
 
 - Question: How do instruction order and BuildKit cache mounts affect Docker build caching and rebuild time?
 - Independent variables: Layer order in Dockerfile (right / wrong) × BuildKit cache mount for `/root/.m2` (with / without)
-- Measurements: Cold build time, incremental rebuild time and rebuild time on a reused machine (seconds)
+- Measurements: Cold build time, rebuild time on a reused machine and incremental rebuild time (seconds)
 - Pipeline: GitHub Actions
 
 | Variant | Order | Cache mount | Description |
@@ -109,8 +109,18 @@ All four variants use the same Maven commands and the same runtime stage; each p
 | Scenario | Layer cache | Cache mount | Expected result |
 |---|---|---|---|
 | S1 — Cold build | empty (`--no-cache`) | cleared before every run | S1 establishes the fair baseline: no cache advantage for any variant |
-| S2 — Incremental rebuild | filled, src/ modified, pom.xml unchanged | filled | S2 quantifies how much time correct ordering and the cache mount save during a typical workflow where only source code changes; only `cache-wrong` is expected to re-download |
-| S3 — Rebuild on a reused machine | empty (`--no-cache`) | filled | S3 represents a CI runner that builds from scratch but keeps its cache mount; only the mount variants are expected to be fast, regardless of order. The variants without a mount serve as a control. |
+| S2 — Rebuild on a reused machine | deleted (`docker builder prune --filter type=regular`) | filled by S1, kept | S2 represents a CI runner that builds from scratch but keeps its cache mount; only the mount variants are expected to be fast, regardless of order. The variants without a mount serve as a control. |
+| S3 — Incremental rebuild | filled, src/ modified, pom.xml unchanged | filled | S3 quantifies how much time correct ordering and the cache mount save during a typical workflow where only source code changes; only `cache-wrong` is expected to re-download |
+
+The scenarios increase step by step in what is cached: nothing (S1), only the cache mount (S2), the layer cache and the cache mount (S3).
+
+| Scenario | Layer cache | Cache mount | Situation | Expected |
+|---|---|---|---|---|
+| S1 cold | ❌ | ❌ | brand-new machine | all 4 slow |
+| S2 reused machine | ❌ | ✅ | same machine, layers gone | only the `-mount` variants fast |
+| S3 incremental | ✅ | ✅ | only src/ changed | only `cache-wrong` slow |
+
+`--no-cache` also ignores BuildKit cache mounts (verified in a preliminary test: 144 s with `--no-cache` and a filled mount vs. 20 s after deleting only the layer cache). S1 therefore uses `--no-cache` plus an explicitly cleared mount, while S2 deletes only the layer cache and keeps the mount.
 
 5 runs per variant per scenario → Shapiro-Wilk → Kruskal-Wallis across the four variants → pairwise Mann-Whitney U with Bonferroni correction (α = 0.05).
 

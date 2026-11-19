@@ -2,7 +2,9 @@ FROM maven:3.9.16-eclipse-temurin-21@sha256:99e61abcff91a9b1333463bd8451fb18495d
 
 WORKDIR /build
 COPY pom.xml .
-COPY portfolio-service ./portfolio-service
+COPY portfolio-service/pom.xml ./portfolio-service/
+RUN mvn -B -q -f portfolio-service/pom.xml dependency:go-offline
+COPY portfolio-service/src ./portfolio-service/src
 
 RUN mvn -B -q -f portfolio-service/pom.xml package -DskipTests
 

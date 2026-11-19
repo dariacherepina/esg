@@ -21,8 +21,9 @@
              records time from `docker run` until /actuator/health is UP, and the JVM-reported
              application_ready_time_seconds, then idle memory after -MemoryWarmupSeconds.
              Every variant runs with the same JVM flags (-JvmFlags). Warm-up runs are not recorded.
-    cache    experiment 2: Dockerfile.cache-right vs Dockerfile.cache-wrong per service.
-             S1 = cold build (--no-cache), S2 = rebuild after one .java file changed (then restored).
+    cache    experiment 2: Dockerfile.cache-{wrong,right}[-mount] per service (order x BuildKit cache mount).
+             S1 = cold build (--no-cache, cache mount cleared), S2 = rebuild after deleting the layer cache
+             but keeping the cache mount (reused machine), S3 = rebuild after one .java file changed (then restored).
     load     k6 load test against esg-score-service: throughput, p99 latency, peak memory.
 
   Repeats are interleaved (run 1 of every image, then run 2, ...) so that network or machine
@@ -53,6 +54,8 @@ param(
     [string] $Label = '',
     [string] $JvmFlags = '-XX:+UseContainerSupport -XX:MaxRAMPercentage=75',
     [int] $MemoryWarmupSeconds = 30,
+    [ValidateSet('cache-wrong', 'cache-right', 'cache-wrong-mount', 'cache-right-mount')]
+    [string[]] $CacheVariants = @('cache-wrong', 'cache-right', 'cache-wrong-mount', 'cache-right-mount'),
     [int] $LoadRepeats = 5,
     [int] $LoadVUs = 50,
     [string] $LoadDuration = '60s',
@@ -355,22 +358,31 @@ try {
         }
     }
     if ($Phases -contains 'cache') {
-        Write-Host '== cache: S1 cold build and S2 incremental rebuild (src/ changed)'
+        Write-Host '== cache: S1 cold, S2 reused machine (no layer cache, warm mount), S3 incremental (src/ changed)'
         docker pull -q $mavenImage | Out-Null
         docker pull -q $alpineImage | Out-Null
         for ($r = 1; $r -le $Repeats; $r++) {
-            foreach ($s in $Services) { foreach ($v in 'cache-right', 'cache-wrong') {
+            foreach ($s in $Services) { foreach ($v in $CacheVariants) {
                 $file = "$s/Dockerfile.$v"
                 $tag = "${s}:$v"
 
-                # S1: cold, no cache for either variant
+                # S1: cold - no layer cache (--no-cache) and an empty cache mount (--no-cache keeps mounts)
+                docker builder prune -f --filter type=exec.cachemount 2>$null | Out-Null
                 $sw = [Diagnostics.Stopwatch]::StartNew()
                 docker build --no-cache -q -f $file -t $tag . | Out-Null
                 $sw.Stop()
                 if ($LASTEXITCODE -ne 0) { Write-Warning "S1 failed: $s $v run $r"; continue }
                 Write-Result 'cache_s1_cold' $s $v $r $sw.Elapsed.TotalSeconds 's'
 
-                # S2: make sure the unchanged source is in the cache, then change one .java file
+                # S2: reused machine - layer cache deleted, cache mount from S1 kept (--no-cache would ignore the mount too)
+                docker builder prune -af --filter type=regular 2>$null | Out-Null
+                $sw = [Diagnostics.Stopwatch]::StartNew()
+                docker build -q -f $file -t $tag . | Out-Null
+                $sw.Stop()
+                if ($LASTEXITCODE -ne 0) { Write-Warning "S2 failed: $s $v run $r"; continue }
+                Write-Result 'cache_s2_reused' $s $v $r $sw.Elapsed.TotalSeconds 's'
+
+                # S3: make sure the unchanged source is in the layer cache, then change one .java file
                 docker build -q -f $file -t $tag . | Out-Null
                 $src = Get-ChildItem (Join-Path $s 'src/main/java') -Recurse -Filter '*Application.java' | Select-Object -First 1
                 $original = [IO.File]::ReadAllText($src.FullName)
@@ -380,13 +392,14 @@ try {
                     $sw = [Diagnostics.Stopwatch]::StartNew()
                     docker build -q -f $file -t $tag . | Out-Null
                     $sw.Stop()
-                    if ($LASTEXITCODE -ne 0) { Write-Warning "S2 failed: $s $v run $r"; continue }
-                    Write-Result 'cache_s2_incremental' $s $v $r $sw.Elapsed.TotalSeconds 's'
+                    if ($LASTEXITCODE -ne 0) { Write-Warning "S3 failed: $s $v run $r"; continue }
+                    Write-Result 'cache_s3_incremental' $s $v $r $sw.Elapsed.TotalSeconds 's'
                 } finally {
                     [IO.File]::WriteAllText($src.FullName, $original)   # always restore the source file
                 }
             } }
         }
+        docker builder prune -f --filter type=exec.cachemount 2>$null | Out-Null   # leave no warm mount behind
     }
     if ($Phases -contains 'load') {
         $s = 'esg-score-service'   # the load test targets this service only
