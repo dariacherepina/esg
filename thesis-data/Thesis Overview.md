@@ -6,7 +6,7 @@
 
 **Abstract**
 
-This thesis presents a controlled empirical study of four Dockerfile variants — a single-stage build, and multi-stage builds with a JDK on Ubuntu, a JRE on Ubuntu, and a JRE on Alpine Linux — applied uniformly to a self-developed system of four Spring Boot microservices. Five metrics are measured: image size, build time, container startup time, runtime memory (at idle and peak under load), and application throughput with p99 latency under sustained load. Additionally, Experiment 2 isolates the effect of build caching on rebuild time in a 2×2 design: instruction ordering (cache-optimal vs. cache-suboptimal) combined with and without a BuildKit cache mount for the Maven repository, measured for a cold build, a rebuild on a reused build machine, and an incremental rebuild after a source change. A supplementary experiment examines how far these caching results generalize to ephemeral GitHub-hosted runners with a remote cache backend.
+This thesis presents a controlled empirical study of four Dockerfile variants — a single-stage build, and multi-stage builds with a JDK on Ubuntu, a JRE on Ubuntu, and a JRE on Alpine Linux — applied uniformly to a self-developed system of four Spring Boot microservices. Five metrics are measured: image size, build time, container startup time, runtime memory (at idle and peak under load), and application throughput with p99 latency under sustained load. Additionally, Experiment 2 isolates the effect of build caching on rebuild time in a 2×2 design: instruction ordering (cache-optimal vs. cache-suboptimal) combined with and without a BuildKit cache mount for the Maven repository, measured for a cold build, a rebuild on a reused build machine, an incremental rebuild after a source change, and a rebuild after a dependency change. A supplementary experiment examines how far these caching results generalize to ephemeral GitHub-hosted runners with a remote cache backend.
 
 ## Motivation 
 Docker has become the standard for packaging and deploying microservices, and with it comes a set of widely repeated recommendations: use multi-stage builds to keep images small, choose Alpine Linux as a minimal base image, and structure Dockerfiles to maximize cache reuse. This thesis documents the effect of these recommendations for a Java/Spring Boot system, measured across the metrics that matter in production: image size, build time, container startup time, runtime memory, and performance under load.
@@ -21,7 +21,7 @@ Development and CI/CD workflows, source code changes constantly while dependency
 
 RQ1 - How do multi-stage builds and base image selection affect image size, build time, container startup time, runtime memory, and throughput with p99 latency under load in a homogeneous Java/Spring Boot microservice system?
 
-RQ2 - How do instruction ordering and BuildKit cache mounts in a multi-stage Dockerfile affect Docker build cache reuse and rebuild time, for a rebuild on a reused build machine and for an incremental rebuild after a source-only change?
+RQ2 - How do instruction ordering and BuildKit cache mounts in a multi-stage Dockerfile affect Docker build cache reuse and rebuild time, for a rebuild on a reused build machine, for an incremental rebuild after a source-only change, and for a rebuild after a dependency change?
 
 ## Research Focus
 
@@ -64,7 +64,7 @@ Independent variable: Dockerfile variant
 
 - Measurement:
   - Image size (MB): compressed (layer sizes in a registry, i.e. what a pull transfers) and uncompressed
-  - Build time (seconds), cold build (`--no-cache`)
+  - Build time (seconds), cold build (`--no-cache`); base images are pulled once beforehand and not timed
   - Container startup time (seconds): `docker run` until `/actuator/health` is UP, and the JVM-reported application ready time
   - Runtime memory at idle (MiB, 30 s after startup) and peak memory under load (MiB)
   - Throughput (req/s) and p99 latency (ms) under load
@@ -72,6 +72,11 @@ Independent variable: Dockerfile variant
 - Pipeline: GitHub Actions
 - All repeated metrics (5 runs per variant → Shapiro-Wilk normality test → Kruskal-Wallis (non-parametric, α = 0.05) → pairwise Mann-Whitney U with Bonferroni correction as post-hoc test). Image size is deterministic (one value per build) and reported as % reduction per step.
 - All variants run with identical JVM flags (`-XX:+UseContainerSupport -XX:MaxRAMPercentage=75`) and a 512 MB memory limit; runs are interleaved across variants.
+  - Why identical flags: the single-stage Dockerfile starts Java without flags, the multi-stage Dockerfiles set them via `JAVA_OPTS`. The measurement script sets the same flags for every variant, so differences in memory or speed are caused by the image, not by different heap settings.
+  - Why `MaxRAMPercentage=75`: the JVM default of 25 % would limit the heap to 128 MB of the 512 MB container limit, which leads to frequent garbage collection (or an `OutOfMemoryError`) for a Spring Boot service with Hibernate, Tomcat and RabbitMQ under load; the load test would then mainly measure the garbage collector. 75 % (384 MB heap) is a common value for containers in which the JVM is the only process; the remaining 128 MB are left for non-heap memory (metaspace, thread stacks, JIT code, direct buffers). `UseContainerSupport` has been enabled by default since Java 10 and is set only for transparency.
+  - Consequence: the measured idle and peak memory also depend on this setting, because a larger permitted heap is collected later. The comparison between variants is unaffected, since all use the same value, but the absolute memory values apply to this configuration only. If non-heap memory exceeded the remaining 128 MB, Docker would terminate the container for exceeding the limit; this did not occur in the preliminary tests (about 300 MiB total under load).
+  - Why a memory limit: without a limit, the JVM would size its heap from the memory of the whole machine, so memory values would depend on the host instead of the image. Memory limits are also standard in production (Kubernetes, Docker Compose).
+  - Why interleaved runs: run 1 of every variant, then run 2, and so on. Changing conditions during a long measurement (network speed, thermal throttling of the laptop) are spread over all variants instead of affecting only one.
 - All variants use the same Maven build steps (`dependency:go-offline`, then `package -DskipTests`), so they differ only in the number of stages and the runtime image.
 
 | Variant | Base image |
@@ -86,12 +91,13 @@ Independent variable: Dockerfile variant
 Known limitations:
 - The single-stage variant runs on the JDK of the Maven image (Temurin 21.0.12.1, Ubuntu 24.04), the multi-stage variants on Temurin 21.0.13 (Ubuntu 26.04 or Alpine 3.24). This is inherent to the official images.
 - Cold build time is dominated by resolving dependencies from Maven Central (about 99 % in a preliminary measurement) and therefore sensitive to network conditions. `dependency:go-offline` also resolves test-scoped dependencies and unused plugin dependencies, which increases the absolute build time of all variants equally.
+- With 4 variants and 5 runs, the smallest possible Bonferroni-adjusted post-hoc p-value is 0.048: a pairwise difference can only be significant if the runs of the two variants do not overlap at all.
 
 ### Experiment 2 — Build Time & Cache Efficiency
 
 - Question: How do instruction order and BuildKit cache mounts affect Docker build caching and rebuild time?
 - Independent variables: Layer order in Dockerfile (right / wrong) × BuildKit cache mount for `/root/.m2` (with / without)
-- Measurements: Cold build time, rebuild time on a reused machine and incremental rebuild time (seconds)
+- Measurements: Cold build time, rebuild time on a reused machine, incremental rebuild time and rebuild time after a dependency change (seconds)
 - Pipeline: GitHub Actions
 
 | Variant | Order | Cache mount | Description |
@@ -105,25 +111,36 @@ All four variants use the same Maven commands and the same runtime stage; each p
 
 | Scenario | Layer cache | Cache mount | Expected result |
 |---|---|---|---|
-| S1 — Cold build | empty (`--no-cache`) | cleared before every run | S1 establishes the fair baseline: no cache advantage for any variant |
+| S1 — Cold build | empty (whole build cache deleted, then `--no-cache`) | deleted with the build cache before every run | S1 establishes the fair baseline: no cache advantage for any variant |
 | S2 — Rebuild on a reused machine | deleted (`docker builder prune --filter type=regular`) | filled by S1, kept | S2 represents a CI runner that builds from scratch but keeps its cache mount; only the mount variants are expected to be fast, regardless of order. The variants without a mount serve as a control. |
 | S3 — Incremental rebuild | filled, src/ modified, pom.xml unchanged | filled | S3 quantifies how much time correct ordering and the cache mount save during a typical workflow where only source code changes; only `cache-wrong` is expected to re-download |
+| S4 — Dependency change | filled, a dependency added to the module `pom.xml` | filled | S4 represents a dependency update (e.g. a Dependabot pull request): the dependency layer is invalidated for both orders, so `cache-right` also re-downloads everything, while the mount variants only download the new artifact |
 
-The scenarios increase step by step in what is cached: nothing (S1), only the cache mount (S2), the layer cache and the cache mount (S3).
+The scenarios S1–S3 increase step by step in what is cached: nothing (S1), only the cache mount (S2), the layer cache and the cache mount (S3). S4 changes what invalidates the cache: not the source code, but the dependency definition.
 
 | Scenario | Layer cache | Cache mount | Situation | Expected |
 |---|---|---|---|---|
 | S1 cold | ❌ | ❌ | brand-new machine | all 4 slow |
 | S2 reused machine | ❌ | ✅ | same machine, layers gone | only the `-mount` variants fast |
 | S3 incremental | ✅ | ✅ | only src/ changed | only `cache-wrong` slow |
+| S4 dependency change | ✅ (dependency layer invalid) | ✅ | pom.xml changed | only the `-mount` variants fast |
 
-`--no-cache` also ignores BuildKit cache mounts (verified in a preliminary test: 144 s with `--no-cache` and a filled mount vs. 20 s after deleting only the layer cache). S1 therefore uses `--no-cache` plus an explicitly cleared mount, while S2 deletes only the layer cache and keeps the mount.
+S4 is simulated by adding `org.apache.commons:commons-lang3` (version managed by Spring Boot) to the module `pom.xml`; the file is restored after the build. Together, S3 and S4 show the difference between the two mechanisms: correct ordering protects against source changes only, the cache mount also against dependency changes.
+
+`--no-cache` also ignores BuildKit cache mounts (verified in a preliminary test: 144 s with `--no-cache` and a filled mount vs. 20 s after deleting only the layer cache). S1 therefore deletes the whole build cache including the mount (`docker builder prune -af`) and builds with `--no-cache`, while S2 deletes only the layer cache and keeps the mount.
 
 5 runs per variant per scenario → Shapiro-Wilk → Kruskal-Wallis across the four variants → pairwise Mann-Whitney U with Bonferroni correction (α = 0.05).
 
 Services: Experiment 2 examines a caching mechanism that is independent of the application code; its effect size depends on the volume of resolved dependencies. It is therefore measured on the services with the smallest (report-service: no database stack) and the largest dependency set (esg-score-service: database stack and RabbitMQ, about 252 MB of resolved artifacts). The other two services share almost the same dependency set as esg-score-service.
 
 The cache mount is shared by all builds on a machine by default, so it is cleared between variants where a measurement requires it, to prevent one variant from warming it for another. Its benefit only applies to reused build machines such as the self-hosted runner of this study; on ephemeral CI runners the mount is empty on every build. The cache-optimal ordering follows the widespread pattern of resolving dependencies in a separate layer via `mvn dependency:go-offline` [citation: Docker documentation]; cache mounts are described in [citation: Docker BuildKit documentation].
+
+Edge cases and limitations of Experiment 2:
+- **`dependency:go-offline` is not complete.** Some plugins load additional artifacts only when they run, so `package` can still download files after `go-offline`. Checked on 2026-11-20 for esg-score-service (empty Maven repository, `go-offline`, then `package` with full logging): `package` still downloaded 37 files (24 POMs, 13 JARs), mainly runtime libraries of Hibernate and Spring AMQP such as `byte-buddy`, `aspectjweaver`, `amqp-client` and `jaxb-runtime`. In `cache-right` these files are downloaded again on every source change, because the `package` step follows `COPY src`; the mount variants keep them. This is expected to make `cache-right` slightly slower than the mount variants in S3.
+- **Maven update checks.** Maven checks plugin and repository metadata for updates once a day by default, so a build with a full cache can still make short network requests. This adds noise to the cached scenarios; offline mode (`-o`) is not used because of the previous point.
+- **Cache mount eviction.** BuildKit's garbage collection deletes build cache, including cache mounts, when a size limit is exceeded. On a machine with little disk space the mount could be empty unexpectedly. The measurement script prunes the cache itself at fixed points, so automatic eviction is unlikely; if an S2 or S4 time of a mount variant is close to S1, eviction is the first explanation to check.
+- **Parallel builds.** All builds share the same mount by default (`sharing=shared`); concurrent builds writing to the same Maven repository can conflict, for which BuildKit offers `sharing=locked`. Not relevant here because all builds run sequentially, but relevant for practitioners.
+- **Fresh checkouts in CI.** Docker's build cache compares file contents (checksums), not timestamps, so a fresh checkout with new file timestamps still hits the cache. This supports transferring the results to CI pipelines that clone the repository for every build.
 
 ### Supplementary Experiment 3 — Cache Backends on Hosted Runners (Generalizability)
 
@@ -160,7 +177,7 @@ Limitations: one service and one Dockerfile; GitHub-hosted runner hardware is no
 
 ## Reproducibility & CI/CD
 
-Both Measurement Study 1 and Experiment 2 are executed via a GitHub Actions workflow running on a self-hosted runner registered to the thesis repository. The self-hosted runner is the author's laptop (Windows 11 Home, Docker Desktop), used exclusively for the measurements while they run: other containers are stopped (the workflow refuses to start otherwise) and no other applications run. All jobs run sequentially on this machine (`.github/workflows/experiments.yml`, started by hand). Measurement Study 1 and Experiment 2 run as separate workflow runs. Each run records the host environment (Windows, CPU, RAM, Docker, tool versions) in `environment.txt` next to the measurements. The build cache is pruned automatically at points where it is not reused, because the laptop has limited disk space. Only the supplementary Experiment 3 (configurations A–C) runs on GitHub-hosted runners (`ubuntu-latest`), in a separate workflow.
+Both Measurement Study 1 and Experiment 2 are executed via a GitHub Actions workflow running on a self-hosted runner registered to the thesis repository. The self-hosted runner is the author's laptop (Windows 11 Home, Docker Desktop), used exclusively for the measurements while they run: other containers are stopped (the workflow refuses to start otherwise) and no other applications run. All jobs run sequentially on this machine (`.github/workflows/experiments.yml`, started by hand). Measurement Study 1 and Experiment 2 run as separate workflow runs. Each run records the host environment (Windows, CPU, RAM, Docker, tool versions) in `environment.txt` next to the measurements. The build cache is pruned automatically at points where it is not reused, because the laptop has limited disk space. Limitations of this setup: Docker Desktop runs the containers in a WSL2 Linux VM (16 CPUs, 7.6 GiB memory) rather than natively, the hardware is a consumer laptop, and dependencies are downloaded over a home network connection. An Azure VM was evaluated first but could not be provisioned within the student subscription (`VM.md`). Only the supplementary Experiment 3 (configurations A–C) runs on GitHub-hosted runners (`ubuntu-latest`), in a separate workflow.
 
 **Infrastructure:**
 
@@ -171,7 +188,7 @@ Both Measurement Study 1 and Experiment 2 are executed via a GitHub Actions work
 - Image size measured via a local registry (registry:2.8.3)
 - Frontend (Nginx) is an UI profile; not part of any experiment
 
-Infrastructure:
+Pinned infrastructure images (base images of the variants: see `Tools Versions.md`):
 
 | Tag | Pinned? |
 |---|---|

@@ -23,7 +23,8 @@
              Every variant runs with the same JVM flags (-JvmFlags). Warm-up runs are not recorded.
     cache    experiment 2: Dockerfile.cache-{wrong,right}[-mount] per service (order x BuildKit cache mount).
              S1 = cold build (--no-cache, cache mount cleared), S2 = rebuild after deleting the layer cache
-             but keeping the cache mount (reused machine), S3 = rebuild after one .java file changed (then restored).
+             but keeping the cache mount (reused machine), S3 = rebuild after one .java file changed (then restored),
+             S4 = rebuild after a dependency was added to the module pom.xml (then restored).
     load     k6 load test against esg-score-service: throughput, p99 latency, peak memory.
 
   Repeats are interleaved (run 1 of every image, then run 2, ...) so that network or machine
@@ -362,7 +363,7 @@ try {
         }
     }
     if ($Phases -contains 'cache') {
-        Write-Host '== cache: S1 cold, S2 reused machine (no layer cache, warm mount), S3 incremental (src/ changed)'
+        Write-Host '== cache: S1 cold, S2 reused machine (no layer cache, warm mount), S3 incremental (src/ changed), S4 dependency change (pom.xml)'
         docker pull -q $mavenImage | Out-Null
         docker pull -q $alpineImage | Out-Null
         for ($r = 1; $r -le $Repeats; $r++) {
@@ -400,6 +401,21 @@ try {
                     Write-Result 'cache_s3_incremental' $s $v $r $sw.Elapsed.TotalSeconds 's'
                 } finally {
                     [IO.File]::WriteAllText($src.FullName, $original)   # always restore the source file
+                }
+
+                # S4: dependency change - a new dependency is added to the module pom.xml (version managed by Spring Boot)
+                $pom = (Resolve-Path (Join-Path $s 'pom.xml')).Path
+                $originalPom = [IO.File]::ReadAllText($pom)
+                try {
+                    $dep = "<dependency><groupId>org.apache.commons</groupId><artifactId>commons-lang3</artifactId></dependency>"
+                    [IO.File]::WriteAllText($pom, $originalPom.Replace('</dependencies>', "    $dep`n    </dependencies>"))
+                    $sw = [Diagnostics.Stopwatch]::StartNew()
+                    docker build -q -f $file -t $tag . | Out-Null
+                    $sw.Stop()
+                    if ($LASTEXITCODE -ne 0) { Write-Warning "S4 failed: $s $v run $r"; continue }
+                    Write-Result 'cache_s4_dependency' $s $v $r $sw.Elapsed.TotalSeconds 's'
+                } finally {
+                    [IO.File]::WriteAllText($pom, $originalPom)   # always restore the pom.xml
                 }
             } }
         }

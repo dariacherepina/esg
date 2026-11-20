@@ -14,7 +14,7 @@ Measurement Study 1, variants single / multi-jdk / multi-jre / multi:
   image sizes       -> deterministic (one value per build), reported with % reduction per step
 Experiment 2 (cache efficiency), 2x2 design order x cache mount:
   variants cache-wrong / cache-right / cache-wrong-mount / cache-right-mount
-  per scenario S1 (cold), S2 (reused machine), S3 (incremental) -> Shapiro-Wilk per variant,
+  per scenario S1 (cold), S2 (reused machine), S3 (incremental), S4 (dependency change) -> Shapiro-Wilk per variant,
   Kruskal-Wallis across the four variants, pairwise Mann-Whitney U with Bonferroni correction
 
 Usage:  python analyze.py <dir with measurements-*.csv> [--out <dir>] [--alpha 0.05]
@@ -34,7 +34,7 @@ EXP1_TESTED = ["build_time", "startup_wall", "startup_ready", "memory_idle",
                "load_throughput", "load_p99", "load_mem_peak"]
 EXP1_SIZES = ["size_compressed", "size_uncompressed"]
 EXP2_VARIANTS = ["cache-wrong", "cache-right", "cache-wrong-mount", "cache-right-mount"]
-EXP2_TESTED = ["cache_s1_cold", "cache_s2_reused", "cache_s3_incremental"]
+EXP2_TESTED = ["cache_s1_cold", "cache_s2_reused", "cache_s3_incremental", "cache_s4_dependency"]
 
 LABELS = {
     "build_time": "Build time, cold (--no-cache)",
@@ -49,6 +49,7 @@ LABELS = {
     "cache_s1_cold": "S1 cold build (--no-cache)",
     "cache_s2_reused": "S2 rebuild on a reused machine (layer cache deleted, cache mount kept)",
     "cache_s3_incremental": "S3 incremental rebuild (src/ changed)",
+    "cache_s4_dependency": "S4 rebuild after a dependency change (pom.xml changed)",
 }
 
 
