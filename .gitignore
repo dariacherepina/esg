@@ -9,3 +9,6 @@ __pycache__/
 
 # k6 binary for the load test (downloaded, not versioned)
 experiments/container/tools/
+
+# Local keys and tokens, never committed
+thesis-data/tokens.md
