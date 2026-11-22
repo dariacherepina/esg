@@ -77,6 +77,7 @@ $jdkImage    = 'eclipse-temurin:21.0.13_9-jdk@sha256:db5cc6341a1d7bc40cdb51e1f0d
 $jreImage    = 'eclipse-temurin:21.0.13_9-jre@sha256:0b99b3376fbb50dbf9c0af8535fdd5b8eb0d3fdfc8b1e4967f383b6919f6901a'
 $alpineImage = 'eclipse-temurin:21.0.13_9-jre-alpine@sha256:ac05c3c42b7c2f1a52c9bd52f01041fa1958231b15ebeae7420429cbc5baf474'
 $baseImages  = $mavenImage, $jdkImage, $jreImage, $alpineImage
+$singleBuildImage = 'esg-maven:3.9.16-temurin-21.0.13'   # built locally from experiments/container/maven-temurin
 
 $variantDef = @{
     'single'    = @{ File = 'Dockerfile';            BuildArgs = @() }
@@ -161,6 +162,30 @@ function ConvertFrom-K6Duration($d) {
         $total += $n * @{ ms = 0.001; s = 1; m = 60; h = 3600 }[$m.Groups[2].Value]
     }
     return $total
+}
+
+function Get-JvmMetrics($baseUrl) {
+    # JVM metrics from Spring Boot Actuator (Micrometer, Prometheus format); summed over all label sets
+    try { $lines = (Invoke-WebRequest "$baseUrl/actuator/prometheus" -UseBasicParsing -TimeoutSec 10).Content -split "`n" }
+    catch { Write-Warning "could not read JVM metrics: $($_.Exception.Message)"; return $null }
+    $sum = {
+        param($name, $filter)
+        $total = 0.0
+        foreach ($l in $lines) {
+            if ($l.StartsWith("$name{") -and (-not $filter -or $l.Contains($filter))) {
+                $total += [double]::Parse(($l.Trim() -split ' ')[-1], $inv)
+            }
+        }
+        $total
+    }
+    return [pscustomobject] @{
+        GcCount       = & $sum 'jvm_gc_pause_seconds_count' $null
+        GcSeconds     = & $sum 'jvm_gc_pause_seconds_sum' $null
+        HeapUsed      = & $sum 'jvm_memory_used_bytes' 'area="heap"'
+        HeapCommitted = & $sum 'jvm_memory_committed_bytes' 'area="heap"'
+        NonHeapUsed   = & $sum 'jvm_memory_used_bytes' 'area="nonheap"'
+        ThreadsPeak   = & $sum 'jvm_threads_peak_threads' $null
+    }
 }
 
 function Read-K6Measure($path, $durationSeconds) {
@@ -289,8 +314,11 @@ $repoRoot = (Resolve-Path (Join-Path (Join-Path $PSScriptRoot '..') '..')).Path
 Push-Location $repoRoot
 try {
     if ($Phases -contains 'build') {
-        Write-Host '== build: pulling base images once (not timed)'
+        Write-Host '== build: pulling base images and building the single-stage build image once (not timed)'
         foreach ($b in $baseImages) { docker pull -q $b | Out-Null }
+        # single starts FROM this image (Temurin 21.0.13 JDK + Maven), so it shares OS and JDK with multi-jdk
+        docker build -q -t $singleBuildImage (Join-Path $PSScriptRoot 'maven-temurin') | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "could not build $singleBuildImage" }
         for ($r = 1; $r -le $Repeats; $r++) {
             foreach ($s in $Services) { foreach ($v in $Variants) {
                 $d = $variantDef[$v]
@@ -467,6 +495,7 @@ try {
                             Write-Warning "no score for company id(s) $($missing -join ', ') - $v run $r skipped"; continue
                         }
                         Start-Sleep -Seconds 5
+                        $jvmBefore = Get-JvmMetrics $base   # GC counters are cumulative, so the load-test share is after minus before
 
                         # memory samples every 2 s while k6 runs; the peak is recorded
                         $memJob = Start-Job -ArgumentList $container -ScriptBlock {
@@ -478,6 +507,7 @@ try {
                         & $K6 run --quiet --env "BASE_URL=$base" --env "VUS=$LoadVUs" --env "DURATION=$LoadDuration" `
                             --env "WARMUP=$LoadWarmup" --out "json=$tmpJson" $k6Script | Out-Null
                         $k6Exit = $LASTEXITCODE
+                        $jvmAfter = Get-JvmMetrics $base
 
                         Stop-Job $memJob
                         $samples = @(Receive-Job $memJob | ForEach-Object { ConvertTo-MiB $_ } | Where-Object { $_ })
@@ -492,6 +522,14 @@ try {
                         if ($null -ne $res.P99) { Write-Result 'load_p99' $s $v $r $res.P99 'ms' }
                         if ($samples.Count -gt 0) {
                             Write-Result 'load_mem_peak' $s $v $r ($samples | Measure-Object -Maximum).Maximum 'MiB'
+                        }
+                        if ($jvmBefore -and $jvmAfter) {
+                            Write-Result 'load_gc_pauses' $s $v $r ($jvmAfter.GcCount - $jvmBefore.GcCount) 'count'
+                            Write-Result 'load_gc_pause_time' $s $v $r (1000 * ($jvmAfter.GcSeconds - $jvmBefore.GcSeconds)) 'ms'
+                            Write-Result 'load_heap_used' $s $v $r ($jvmAfter.HeapUsed / 1MB) 'MiB'
+                            Write-Result 'load_heap_committed' $s $v $r ($jvmAfter.HeapCommitted / 1MB) 'MiB'
+                            Write-Result 'load_nonheap_used' $s $v $r ($jvmAfter.NonHeapUsed / 1MB) 'MiB'
+                            Write-Result 'load_threads_peak' $s $v $r $jvmAfter.ThreadsPeak 'count'
                         }
                     } finally {
                         if ($memJob) { Stop-Job $memJob; Remove-Job $memJob -Force }
