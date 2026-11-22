@@ -25,7 +25,9 @@
              S1 = cold build (--no-cache, cache mount cleared), S2 = rebuild after deleting the layer cache
              but keeping the cache mount (reused machine), S3 = rebuild after one .java file changed (then restored),
              S4 = rebuild after a dependency was added to the module pom.xml (then restored).
-    load     k6 load test against esg-score-service: throughput, p99 latency, peak memory.
+    load     k6 load test against esg-score-service: throughput, p99 latency, peak memory (docker stats and
+             kernel RSS), GC pauses from the JVM's GC log. -Nmt adds Native Memory Tracking (analysis runs only),
+             -ArenaControl adds multi-jre-arena2 (multi-jre image with MALLOC_ARENA_MAX=2, glibc limited to 2 arenas).
 
   Repeats are interleaved (run 1 of every image, then run 2, ...) so that network or machine
   load changes during the session spread over all variants instead of hitting one.
@@ -61,6 +63,8 @@ param(
     [int] $LoadVUs = 50,
     [string] $LoadDuration = '60s',
     [string] $LoadWarmup = '10s',
+    [switch] $Nmt,   # Native Memory Tracking in the load phase; costs memory itself, so not for the main runs
+    [switch] $ArenaControl,   # load phase: extra variant multi-jre-arena2 = multi-jre image with MALLOC_ARENA_MAX=2
     [string] $K6 = (Join-Path $PSScriptRoot 'tools\k6.exe'),
     [string] $Registry = 'ghcr.io/dariacherepina',
     [string] $OutDir = (Join-Path $PSScriptRoot 'results')
@@ -185,7 +189,49 @@ function Get-JvmMetrics($baseUrl) {
         HeapCommitted = & $sum 'jvm_memory_committed_bytes' 'area="heap"'
         NonHeapUsed   = & $sum 'jvm_memory_used_bytes' 'area="nonheap"'
         ThreadsPeak   = & $sum 'jvm_threads_peak_threads' $null
+        Uptime        = & $sum 'process_uptime_seconds' $null   # same clock as the GC log's uptime decorator
     }
+}
+
+function Get-ProcMemory($c) {
+    # Kernel view of the Java process (PID 1): VmRSS = resident now, VmHWM = highest RSS since start
+    $status = docker exec $c cat /proc/1/status 2>$null
+    $mem = @{}
+    foreach ($l in $status) { if ($l -match '^(VmRSS|VmHWM):\s+(\d+) kB') { $mem[$Matches[1]] = [double] $Matches[2] / 1024 } }
+    return $mem
+}
+
+function Get-Percentile($sorted, $p) {
+    # linear interpolation between the two nearest ranks, same definition as k6 (input must be sorted)
+    $i = $p * ($sorted.Count - 1)
+    $lo = [math]::Floor($i); $hi = [math]::Ceiling($i)
+    return $sorted[$lo] + ($sorted[$hi] - $sorted[$lo]) * ($i - $lo)
+}
+
+function Read-GcPauses($path, $from, $to) {
+    # Unified GC log lines like "[12.345s] GC(3) Pause Young (Allocation Failure) 120M->30M(300M) 4.567ms"
+    $pauses = New-Object 'System.Collections.Generic.List[double]'
+    foreach ($l in [IO.File]::ReadAllLines($path)) {
+        if ($l -match '^\[([\d.]+)s\].* Pause .* ([\d.]+)ms$') {
+            $t = [double]::Parse($Matches[1], $inv)
+            if ($t -ge $from -and $t -le $to) { $pauses.Add([double]::Parse($Matches[2], $inv)) }
+        }
+    }
+    $pauses.Sort()
+    return , $pauses
+}
+
+function Read-NmtSummary($lines) {
+    # NMT summary printed at JVM exit (bytes, or KB/MB with a scale) -> committed MiB per category plus "Total"
+    $result = [ordered] @{}
+    $toMiB = { param($n, $unit) [double] $n * @{ '' = 1; 'KB' = 1KB; 'MB' = 1MB; 'GB' = 1GB }["$unit"] / 1MB }
+    foreach ($l in $lines) {
+        if ($l -match '^Total: reserved=\d+[KMG]?B?, committed=(\d+)([KMG]B)?') { $result['Total'] = & $toMiB $Matches[1] $Matches[2] }
+        elseif ($l -match '^-\s+(.+?) \(reserved=\d+[KMG]?B?, committed=(\d+)([KMG]B)?') {
+            $result[$Matches[1].Trim()] = & $toMiB $Matches[2] $Matches[3]
+        }
+    }
+    return $result
 }
 
 function Read-K6Measure($path, $durationSeconds) {
@@ -257,13 +303,11 @@ function Measure-Startup($s, $v, $run, [bool] $record) {
     $readyLine = $metrics | Where-Object { $_ -like 'application_ready_time_seconds*' } | Select-Object -First 1
 
     # Memory at idle: wait until startup work (JIT, Hibernate, connection pools) has settled.
-    $memMiB = $null
+    $memMiB = $null; $proc = @{}
     if ($record) {
         Start-Sleep -Seconds $MemoryWarmupSeconds
-        $mem = (docker stats $container --no-stream --format '{{.MemUsage}}') -split '/' | Select-Object -First 1
-        if ($mem -match '([\d.]+)\s*([KMG])iB') {
-            $memMiB = [double]::Parse($Matches[1], $inv) * @{ K = 1 / 1024; M = 1; G = 1024 }[$Matches[2]]
-        }
+        $memMiB = ConvertTo-MiB (docker stats $container --no-stream --format '{{.MemUsage}}')
+        $proc = Get-ProcMemory $container   # cgroup usage (docker stats) also counts page cache, RSS only the process
     }
     docker rm -f $container | Out-Null
 
@@ -271,6 +315,7 @@ function Measure-Startup($s, $v, $run, [bool] $record) {
         Write-Result 'startup_wall' $s $v $run $sw.Elapsed.TotalSeconds 's'
         Write-Result 'startup_ready' $s $v $run ([double]::Parse(($readyLine.Trim() -split ' ')[-1], $inv)) 's'
         if ($memMiB) { Write-Result 'memory_idle' $s $v $run $memMiB 'MiB' }
+        if ($proc.VmRSS) { Write-Result 'memory_idle_rss' $s $v $run $proc.VmRSS 'MiB' }
     }
 }
 
@@ -462,16 +507,25 @@ try {
             $hostPort = 10000 + $port[$s]   # 18082, same as in Measure-Startup
             $base = "http://localhost:$hostPort"
             $measureSeconds = ConvertFrom-K6Duration $LoadDuration
+            # GC log (gc+init also logs the collector and the CPUs the JVM sees); NMT only on request
+            $loadFlags = "$JvmFlags -Xlog:gc,gc+init:file=/tmp/gc.log:uptime"
+            if ($Nmt) { $loadFlags += ' -XX:NativeMemoryTracking=summary -XX:+UnlockDiagnosticVMOptions -XX:+PrintNMTStatistics' }
+            $diagDir = Join-Path $OutDir "diagnostics-$prefix"
+            New-Item -ItemType Directory -Force $diagDir | Out-Null
+            # control run: the multi-jre image with glibc limited to 2 malloc arenas, placed right after multi-jre
+            $loadVariants = foreach ($v in $Variants) { $v; if ($ArenaControl -and $v -eq 'multi-jre') { 'multi-jre-arena2' } }
             for ($r = 1; $r -le $LoadRepeats; $r++) {
-                foreach ($v in $Variants) {
-                    $img = RemoteTag $s $v
-                    if (-not (Test-Image $img)) { $img = LocalTag $s $v }
+                foreach ($v in $loadVariants) {
+                    $imageVariant = if ($v -eq 'multi-jre-arena2') { 'multi-jre' } else { $v }
+                    $img = RemoteTag $s $imageVariant
+                    if (-not (Test-Image $img)) { $img = LocalTag $s $imageVariant }
                     if (-not (Test-Image $img)) { Write-Warning "no image for $s $v - run the build phase first"; continue }
 
                     docker rm -f $container 2>$null | Out-Null
                     $runArgs = @('run', '-d', '--name', $container, '--network', $network, '--memory', '512m', '-p', "${hostPort}:$($port[$s])")
                     foreach ($e in $containerEnv[$s]) { $runArgs += @('-e', $e) }
-                    $runArgs += @('-e', "JAVA_TOOL_OPTIONS=$JvmFlags", '-e', 'JAVA_OPTS=')   # same JVM flags as the startup phase
+                    $runArgs += @('-e', "JAVA_TOOL_OPTIONS=$loadFlags", '-e', 'JAVA_OPTS=')   # startup phase flags plus logging
+                    if ($v -eq 'multi-jre-arena2') { $runArgs += @('-e', 'MALLOC_ARENA_MAX=2') }   # read by glibc at process start
                     docker @runArgs $img | Out-Null
 
                     $memJob = $null
@@ -508,6 +562,18 @@ try {
                             --env "WARMUP=$LoadWarmup" --out "json=$tmpJson" $k6Script | Out-Null
                         $k6Exit = $LASTEXITCODE
                         $jvmAfter = Get-JvmMetrics $base
+                        $proc = Get-ProcMemory $container
+
+                        # the JRE images have no jcmd, so NMT prints its summary at JVM exit: stop gracefully, read the log
+                        $nmtSummary = $null
+                        if ($Nmt) {
+                            docker stop -t 60 $container 2>$null | Out-Null
+                            $log = docker logs $container 2>&1 | ForEach-Object { "$_" }
+                            [IO.File]::WriteAllLines((Join-Path $diagDir "nmt-$v-run$r.txt"), [string[]] $log, $utf8)
+                            $nmtSummary = Read-NmtSummary $log
+                        }
+                        $gcFile = Join-Path $diagDir "gc-$v-run$r.log"
+                        docker cp "${container}:/tmp/gc.log" $gcFile 2>$null | Out-Null
 
                         Stop-Job $memJob
                         $samples = @(Receive-Job $memJob | ForEach-Object { ConvertTo-MiB $_ } | Where-Object { $_ })
@@ -530,6 +596,24 @@ try {
                             Write-Result 'load_heap_committed' $s $v $r ($jvmAfter.HeapCommitted / 1MB) 'MiB'
                             Write-Result 'load_nonheap_used' $s $v $r ($jvmAfter.NonHeapUsed / 1MB) 'MiB'
                             Write-Result 'load_threads_peak' $s $v $r $jvmAfter.ThreadsPeak 'count'
+                            if (Test-Path $gcFile) {
+                                $pauses = Read-GcPauses $gcFile $jvmBefore.Uptime $jvmAfter.Uptime
+                                if ($pauses.Count -gt 0) {
+                                    Write-Result 'load_gc_pause_p50' $s $v $r (Get-Percentile $pauses 0.5) 'ms'
+                                    Write-Result 'load_gc_pause_p95' $s $v $r (Get-Percentile $pauses 0.95) 'ms'
+                                    Write-Result 'load_gc_pause_max' $s $v $r $pauses[$pauses.Count - 1] 'ms'
+                                }
+                            }
+                        }
+                        if ($proc.VmHWM) { Write-Result 'load_rss_peak' $s $v $r $proc.VmHWM 'MiB' }
+                        if ($nmtSummary) {
+                            foreach ($k in $nmtSummary.Keys) {
+                                Write-Result ('nmt_' + ($k.ToLower() -replace '[^a-z0-9]+', '_')) $s $v $r $nmtSummary[$k] 'MiB'
+                            }
+                            # memory the kernel sees but the JVM doesn't account for: libc allocator, shared libraries
+                            if ($proc.VmRSS -and $nmtSummary['Total']) {
+                                Write-Result 'nmt_rss_unaccounted' $s $v $r ($proc.VmRSS - $nmtSummary['Total']) 'MiB'
+                            }
                         }
                     } finally {
                         if ($memJob) { Stop-Job $memJob; Remove-Job $memJob -Force }
