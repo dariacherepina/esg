@@ -5,12 +5,12 @@ on:
   workflow_dispatch:
     inputs:
       study:
-        description: "test = short trial run; study1 = Measurement Study 1; exp2 = Experiment 2"
+        description: "test = short trial run; study1 = Measurement Study 1"
         type: choice
-        options: [test, study1, exp2]
+        options: [test, study1]
         default: test
       repeats:
-        description: "Runs per variant (study1 and exp2)"
+        description: "Runs per variant (study1)"
         type: number
         default: 5
 
@@ -85,7 +85,7 @@ jobs:
       - name: Measure (short trial run)
         if: inputs.study == 'test'
         run: |
-          .\experiments\container\measure-images.ps1 -Services report-service -Phases build,size,startup,cache -Repeats 1 -Label test -OutDir results
+          .\experiments\container\measure-images.ps1 -Services report-service -Phases build,size,startup -Repeats 1 -Label test -OutDir results
           .\experiments\container\measure-images.ps1 -Services esg-score-service -Variants multi -Phases build,load -Repeats 1 -LoadRepeats 1 -LoadDuration 15s -Label test-load -OutDir results
           if (-not (Get-ChildItem results -Filter 'measurements-*.csv')) { throw 'No measurements were written' }
           exit 0
@@ -94,13 +94,6 @@ jobs:
         if: inputs.study == 'study1'
         run: |
           .\experiments\container\measure-images.ps1 -Phases build,size,startup,load -Repeats ${{ inputs.repeats }} -LoadRepeats ${{ inputs.repeats }} -Label study1 -OutDir results
-          if (-not (Get-ChildItem results -Filter 'measurements-*.csv')) { throw 'No measurements were written' }
-          exit 0
-
-      - name: Measure (Experiment 2)
-        if: inputs.study == 'exp2'
-        run: |
-          .\experiments\container\measure-images.ps1 -Services report-service,esg-score-service -Phases cache -Repeats ${{ inputs.repeats }} -Label exp2 -OutDir results
           if (-not (Get-ChildItem results -Filter 'measurements-*.csv')) { throw 'No measurements were written' }
           exit 0
 

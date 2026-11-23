@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-  Measurement Study 1 (single- vs multi-stage, runtime base image) and Experiment 2 (layer cache order).
-  Measures build time, image size, pull time and startup time and writes every value to a CSV.
+  Measurement Study 1 (single- vs multi-stage, runtime base image).
+  Measures build time, image size, pull time, startup time and runtime behaviour under load and writes every value to a CSV.
 
 .DESCRIPTION
   Four image variants per service:
@@ -21,10 +21,6 @@
              records time from `docker run` until /actuator/health is UP, and the JVM-reported
              application_ready_time_seconds, then idle memory after -MemoryWarmupSeconds.
              Every variant runs with the same JVM flags (-JvmFlags). Warm-up runs are not recorded.
-    cache    experiment 2: Dockerfile.cache-{wrong,right}[-mount] per service (order x BuildKit cache mount).
-             S1 = cold build (--no-cache, cache mount cleared), S2 = rebuild after deleting the layer cache
-             but keeping the cache mount (reused machine), S3 = rebuild after one .java file changed (then restored),
-             S4 = rebuild after a dependency was added to the module pom.xml (then restored).
     load     k6 load test against esg-score-service: throughput, p99 latency, peak memory (docker stats and
              kernel RSS), GC pauses from the JVM's GC log. -Nmt adds Native Memory Tracking (analysis runs only),
              -ArenaControl adds multi-jre-arena2 (multi-jre image with MALLOC_ARENA_MAX=2, glibc limited to 2 arenas).
@@ -36,7 +32,7 @@
   # quick test: one service, one run each (about 5 min)
   .\experiments\container\measure-images.ps1 -Services report-service -Repeats 1
 .EXAMPLE
-  # full run: 4 services x 4 variants x 5 repeats, experiment 2 and the load test
+  # full run: 4 services x 4 variants x 5 repeats and the load test
   .\experiments\container\measure-images.ps1
 .EXAMPLE
   # repeat only the pull measurement, 10 runs
@@ -49,16 +45,14 @@ param(
     [ValidateSet('single', 'multi-jdk', 'multi-jre', 'multi')]
     [string[]] $Variants = @('single', 'multi-jdk', 'multi-jre', 'multi'),
 
-    [ValidateSet('build', 'size', 'push', 'pull', 'startup', 'cache', 'load')]
-    [string[]] $Phases = @('build', 'size', 'startup', 'load', 'cache'),
+    [ValidateSet('build', 'size', 'push', 'pull', 'startup', 'load')]
+    [string[]] $Phases = @('build', 'size', 'startup', 'load'),
 
     [int] $Repeats = 5,
     [int] $StartupWarmup = 1,
     [string] $Label = '',
     [string] $JvmFlags = '-XX:+UseContainerSupport -XX:MaxRAMPercentage=75',
     [int] $MemoryWarmupSeconds = 30,
-    [ValidateSet('cache-wrong', 'cache-right', 'cache-wrong-mount', 'cache-right-mount')]
-    [string[]] $CacheVariants = @('cache-wrong', 'cache-right', 'cache-wrong-mount', 'cache-right-mount'),
     [int] $LoadRepeats = 5,
     [int] $LoadVUs = 50,
     [string] $LoadDuration = '60s',
@@ -434,65 +428,6 @@ try {
         for ($r = 1; $r -le $Repeats; $r++) {
             foreach ($s in $Services) { foreach ($v in $Variants) { Measure-Startup $s $v $r $true } }
         }
-    }
-    if ($Phases -contains 'cache') {
-        Write-Host '== cache: S1 cold, S2 reused machine (no layer cache, warm mount), S3 incremental (src/ changed), S4 dependency change (pom.xml)'
-        docker pull -q $mavenImage | Out-Null
-        docker pull -q $alpineImage | Out-Null
-        for ($r = 1; $r -le $Repeats; $r++) {
-            foreach ($s in $Services) { foreach ($v in $CacheVariants) {
-                $file = "$s/Dockerfile.$v"
-                $tag = "${s}:$v"
-
-                # S1: cold - whole build cache deleted (layers and cache mount, also frees disk space), then --no-cache
-                docker builder prune -af 2>$null | Out-Null
-                $sw = [Diagnostics.Stopwatch]::StartNew()
-                docker build --no-cache -q -f $file -t $tag . | Out-Null
-                $sw.Stop()
-                if ($LASTEXITCODE -ne 0) { Write-Warning "S1 failed: $s $v run $r"; continue }
-                Write-Result 'cache_s1_cold' $s $v $r $sw.Elapsed.TotalSeconds 's'
-
-                # S2: reused machine - layer cache deleted, cache mount from S1 kept (--no-cache would ignore the mount too)
-                docker builder prune -af --filter type=regular 2>$null | Out-Null
-                $sw = [Diagnostics.Stopwatch]::StartNew()
-                docker build -q -f $file -t $tag . | Out-Null
-                $sw.Stop()
-                if ($LASTEXITCODE -ne 0) { Write-Warning "S2 failed: $s $v run $r"; continue }
-                Write-Result 'cache_s2_reused' $s $v $r $sw.Elapsed.TotalSeconds 's'
-
-                # S3: make sure the unchanged source is in the layer cache, then change one .java file
-                docker build -q -f $file -t $tag . | Out-Null
-                $src = Get-ChildItem (Join-Path $s 'src/main/java') -Recurse -Filter '*Application.java' | Select-Object -First 1
-                $original = [IO.File]::ReadAllText($src.FullName)
-                try {
-                    # unique comment, so no run can reuse the cache of a previous run's change
-                    [IO.File]::AppendAllText($src.FullName, "`n// cache experiment $v run $r $([guid]::NewGuid())`n")
-                    $sw = [Diagnostics.Stopwatch]::StartNew()
-                    docker build -q -f $file -t $tag . | Out-Null
-                    $sw.Stop()
-                    if ($LASTEXITCODE -ne 0) { Write-Warning "S3 failed: $s $v run $r"; continue }
-                    Write-Result 'cache_s3_incremental' $s $v $r $sw.Elapsed.TotalSeconds 's'
-                } finally {
-                    [IO.File]::WriteAllText($src.FullName, $original)   # always restore the source file
-                }
-
-                # S4: dependency change - a new dependency is added to the module pom.xml (version managed by Spring Boot)
-                $pom = (Resolve-Path (Join-Path $s 'pom.xml')).Path
-                $originalPom = [IO.File]::ReadAllText($pom)
-                try {
-                    $dep = "<dependency><groupId>org.apache.commons</groupId><artifactId>commons-lang3</artifactId></dependency>"
-                    [IO.File]::WriteAllText($pom, $originalPom.Replace('</dependencies>', "    $dep`n    </dependencies>"))
-                    $sw = [Diagnostics.Stopwatch]::StartNew()
-                    docker build -q -f $file -t $tag . | Out-Null
-                    $sw.Stop()
-                    if ($LASTEXITCODE -ne 0) { Write-Warning "S4 failed: $s $v run $r"; continue }
-                    Write-Result 'cache_s4_dependency' $s $v $r $sw.Elapsed.TotalSeconds 's'
-                } finally {
-                    [IO.File]::WriteAllText($pom, $originalPom)   # always restore the pom.xml
-                }
-            } }
-        }
-        docker builder prune -af 2>$null | Out-Null   # leave no warm cache or mount behind, free disk space
     }
     if ($Phases -contains 'load') {
         $s = 'esg-score-service'   # the load test targets this service only
