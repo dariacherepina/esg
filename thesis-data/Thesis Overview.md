@@ -62,7 +62,7 @@ Measurement Study 1 compares the image variants on observable metrics — what a
 | Multi-stage + JRE | eclipse-temurin:21.0.13_9-jre — Ubuntu, JRE only |
 | Multi-stage + Alpine | eclipse-temurin:21.0.13_9-jre-alpine — Alpine, JRE only |
 
-All variants run with identical JVM flags (`-XX:+UseContainerSupport -XX:MaxRAMPercentage=75`), a 512 MB memory limit and a limit of 2 CPUs. The heap is set to 75% of the memory (384 MB) because Java's default of 25% would be too small for Spring Boot under load, which means the absolute memory values apply only to this setting while the comparison between variants stays fair. With less than 2 GB of memory the JVM selects the Serial garbage collector by itself; this is recorded in the GC log of every run.
+All variants run with identical JVM flags (`-XX:+UseContainerSupport -XX:MaxRAMPercentage=75`), a 512 MB memory limit and a limit of 4 CPUs. The heap is set to 75% of the memory (384 MB) because Java's default of 25% would be too small for Spring Boot under load, which means the absolute memory values apply only to this setting while the comparison between variants stays fair. With less than 2 GB of memory the JVM selects the Serial garbage collector by itself; this is recorded in the GC log of every run.
 
 **Ergonomics check (done on 2026-11-23):** the JVM chooses the GC, heap size and thread counts automatically from the CPUs and memory it detects. If the images differed there, a GC difference between them would have a trivial cause. Both JRE images were started with the measurement's limits and flags and compared with `java -version`, `-Xlog:gc*` and `-XX:+PrintFlagsFinal`:
 
@@ -71,12 +71,12 @@ All variants run with identical JVM flags (`-XX:+UseContainerSupport -XX:MaxRAMP
 | JVM build | Temurin-21.0.13+9 (21.0.13+9-LTS) | Temurin-21.0.13+9 (21.0.13+9-LTS) |
 | GC | Serial (ergonomic) | Serial (ergonomic) |
 | Maximum / initial heap | 384 MB / 8 MB | 384 MB / 8 MB |
-| CPUs detected (2-CPU limit) | 2 of 16 | 2 of 16 |
-| JIT compiler threads (2 CPUs / no limit) | 2 / 12 | 2 / 12 |
+| CPUs detected (2-CPU / 4-CPU limit) | 2 / 4 of 16 | 2 / 4 of 16 |
+| JIT compiler threads (2 / 4 CPUs / no limit) | 2 / 3 / 12 | 2 / 3 / 12 |
 | GC threads | 1 (Serial) | 1 (Serial) |
 | Compressed oops, thread stack size | enabled, 1 MB | enabled, 1 MB |
 
-The settings are identical, so differences between the images cannot come from JVM ergonomics. Side observation: with 2 CPUs the JVM runs only 2 JIT compiler threads instead of 12, so warm-up takes longer under the CPU limit; this is why the warm-up is 30 s and measured separately.
+The settings are identical, so differences between the images cannot come from JVM ergonomics. With 4 CPUs the JVM still selects Serial and the same heap on both images. Side observation: the number of JIT compiler threads follows the CPU limit (2, 3 or 12), so warm-up takes longer under a limit; this is why the warm-up is 30 s and measured separately.
 
 ### Part A — Image metrics (all variants, all four services)
 
@@ -101,7 +101,7 @@ The runtime part compares the two images that differ only in the distribution an
 - Concurrency series: 10 / 25 / 50 / 100 / 200 / 400 virtual users. 400 lies above Tomcat's 200 worker threads and is an overload point where requests queue.
 - Each run: a fresh container, a 30 s warm-up at 10 users as a separate k6 run (not evaluated), then 60 s measurement. CPU time and GC counters are read between the two, so JIT compilation during the warm-up does not count towards the measured values.
 - 10 repetitions; within each repetition all level × variant combinations run once in a random order (fixed seed, reproducible), so that drift of the machine during the session does not hit one variant or level systematically
-- 6 levels × 3 variants × 10 repetitions = 180 runs, about 9 hours
+- 6 levels × 3 variants × 10 repetitions = 180 runs, about 6 hours
 
 **Measurements per run**
 
@@ -124,7 +124,15 @@ The runtime part compares the two images that differ only in the distribution an
 | GCs or allocation per request still differ | the Java code or a library allocates differently on the two images; unusual, investigated separately |
 | pause length or time-to-safepoint still differs | something affects how fast the pause itself completes; Part E tests whether this depends on the collector |
 
-**Why a CPU limit of 2:** production containers rarely see all CPUs of a host. The JVM sizes its JIT compiler threads by the CPUs it sees, so the CPU count changes contention and the absolute values. The limit also keeps the service from competing with the load generator (k6 runs on the same machine) for CPU.
+**Why a CPU limit of 4:** production containers rarely see all CPUs of a host, and the limit keeps the service from competing with the load generator (k6 runs on the same machine) for CPU. The value was chosen in a check on 2026-11-23 (Ubuntu JRE, 10 / 50 / 200 users, one run each):
+
+| Limit | Throughput at 10 / 50 / 200 users (req/s) | CPU per request (µs) | Cores used |
+|---|---|---|---|
+| 2 CPUs | 629 / 540 / 577 | 3187 / 3721 / 3490 | 1.99 at every level |
+| 4 CPUs | 3266 / 3299 / 3144 | 836 / 1179 / 1266 | 2.7 / 3.9 / 3.9 |
+| none | 3571 / 6373 / 6841 | 700 / 647 / 657 | 2.5 / 4.1 / 4.4 |
+
+With 2 CPUs the service was CPU-bound already at 10 users and needed 4–5 times the CPU per request: the JVM's 2 JIT compiler threads compete with the request threads for the same 2 CPUs, so the code stays unoptimized and every request stays expensive. Time-to-safepoint rose to 76 ms at 200 users, because threads waiting for a CPU react late to the stop request. Such a setup would compare a CPU-starved JVM rather than the images. With 4 CPUs, CPU cost at low load is close to the unlimited case, and the CPU limit is reached at about 50 users, so the series covers both the range below the limit (10, 25 users) and the range at the limit (50–400 users), where differences in CPU efficiency between the images show in latency and CPU per request. Without a limit, the service did not use more than about 4.4 cores; there the bottleneck is no longer the CPU (likely the database pool of 10 connections), and k6 shares the host's CPUs without any separation.
 
 **Why the arena control:** glibc's allocator creates up to 8 × CPU count separate memory pools (arenas) so that threads rarely wait for each other; each pool keeps freed memory for reuse, which counts as resident memory. musl's allocator (mallocng) has no per-thread arenas. `MALLOC_ARENA_MAX=2` limits glibc to two arenas without changing the image. If the memory difference between the Ubuntu and the Alpine image shrinks in the control variant, the arenas explain that share of it. The control also shows the price of the setting: fewer arenas can mean more waiting under high concurrency.
 
@@ -151,14 +159,14 @@ If a GC difference between the images remains after normalizing (Part B), this p
 | Ubuntu JRE + `MALLOC_ARENA_MAX=2` | | |
 
 - Serial: one GC thread, every pause stops the application completely — the simplest case with the fewest side effects, and what the JVM chooses by itself for this container size
-- G1: the JVM's default on larger machines and the realistic production choice; it runs concurrent GC threads next to the application, which compete for the 2 CPUs
+- G1: the JVM's default on larger machines and the realistic production choice; it runs concurrent GC threads next to the application, which compete for the 4 CPUs
 - Parallel and ZGC are supported by the script (`-LoadGcs parallel,zgc`) but not part of the planned runs; ZGC on JDK 21 is only generational with `-XX:+ZGenerational`
-- 50 and 200 users (where the GC difference was largest in the preliminary runs), 10 runs each: 2 levels × 3 variants × 2 GCs × 10 = 120 runs, about 7 hours
+- 50 and 200 users (where the GC difference was largest in the preliminary runs), 10 runs each: 2 levels × 3 variants × 2 GCs × 10 = 120 runs, about 4 hours
 
 | Result | Interpretation |
 |---|---|
 | the difference appears with every GC | the cause lies outside the GC: allocator, JVM build, thread scheduling |
-| the difference appears only with G1 | an interaction: concurrent GC threads compete with the application for the 2 CPUs, so a difference in CPU efficiency shows here first |
+| the difference appears only with G1 | an interaction: concurrent GC threads compete with the application for the 4 CPUs, so a difference in CPU efficiency shows here first |
 | Ubuntu vs. Alpine differs, Ubuntu + arena2 vs. Alpine does not | points to glibc's allocator |
 
 **Detail runs (`-GcDetail`, 3 runs at 200 users, Serial and G1):** a GC phase log (`-Xlog:gc+phases=debug`) splits each pause into its phases, showing whether one phase differs; a Java Flight Recording (written at JVM exit) records GC, allocation, thread and CPU events for inspection in JDK Mission Control. Both cost some overhead and are not part of the measured runs.
@@ -228,7 +236,7 @@ The cost components have different units (seconds, MB, MiB-hours, CPU-seconds). 
 
 ## Reproducibility & CI/CD
 
-Measurement Study 1 is executed via a GitHub Actions workflow running on a self-hosted runner registered to the thesis repository. The self-hosted runner is the author's laptop (Windows 11 Home, Docker Desktop), used exclusively for the measurements while they run: it runs on mains power, other containers are stopped (the workflow refuses to start otherwise) and no other applications run (including cloud sync clients such as Google Drive). All jobs run sequentially on this machine (`.github/workflows/experiments.yml`, started by hand) as separate workflow runs: `images` (Part A, about 6 hours), `load` (Part B, about 9 hours) and `soak` (Part C, about 5 hours), `nmt` (Part D, about 2 hours), `gc` (Part E, about 7 hours) and `gcdetail` (Part E detail runs, about 1 hour); `test` is a short trial run of all phases. Each run records the host environment (Windows, CPU, RAM, Docker, tool versions) in `environment.txt` next to the measurements. The build cache is pruned automatically after every timed build, because the laptop has limited disk space. Limitations of this setup: Docker Desktop runs the containers in a WSL2 Linux VM (16 CPUs, 7.6 GiB memory) rather than natively, the hardware is a consumer laptop, and dependencies are downloaded over a home network connection. An Azure VM was evaluated first but could not be provisioned within the student subscription (`VM.md`).
+Measurement Study 1 is executed via a GitHub Actions workflow running on a self-hosted runner registered to the thesis repository. The self-hosted runner is the author's laptop (Windows 11 Home, Docker Desktop), used exclusively for the measurements while they run: it runs on mains power, other containers are stopped (the workflow refuses to start otherwise) and no other applications run (including cloud sync clients such as Google Drive). All jobs run sequentially on this machine (`.github/workflows/experiments.yml`, started by hand) as separate workflow runs: `images` (Part A, about 5.5 hours), `load` (Part B, about 6 hours), `soak` (Part C, about 5 hours), `nmt` (Part D, about 1 hour), `gc` (Part E, about 4 hours) and `gcdetail` (Part E detail runs, under 1 hour); about 23 hours in total, run overnight over four nights; `test` is a short trial run of all phases. Each run records the host environment (Windows, CPU, RAM, Docker, tool versions) in `environment.txt` next to the measurements. The build cache is pruned automatically after every timed build, because the laptop has limited disk space. Limitations of this setup: Docker Desktop runs the containers in a WSL2 Linux VM (16 CPUs, 7.6 GiB memory) rather than natively, the hardware is a consumer laptop, and dependencies are downloaded over a home network connection. An Azure VM was evaluated first but could not be provisioned within the student subscription (`VM.md`).
 
 **Infrastructure:**
 

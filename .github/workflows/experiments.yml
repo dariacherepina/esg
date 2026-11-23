@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       study:
-        description: "test = short trial run; images = build, size, startup (~6 h); load = concurrency series (~9 h); soak = long runs (~5 h); nmt = Native Memory Tracking runs (~2 h); gc = variant x GC at 50/200 users (~7 h); gcdetail = GC phases + flight recordings (~1 h)"
+        description: "test = short trial run; images = build, size, startup (~5.5 h); load = concurrency series (~6 h); soak = long runs (~5 h); nmt = Native Memory Tracking runs (~1 h); gc = variant x GC at 50/200 users (~4 h); gcdetail = GC phases + flight recordings (<1 h)"
         type: choice
         options: [test, images, load, soak, nmt, gc, gcdetail]
         default: test

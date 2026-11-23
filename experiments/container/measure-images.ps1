@@ -44,7 +44,7 @@
   # image part: 4 services x 4 variants x 5 repeats (build, size, startup)
   .\experiments\container\measure-images.ps1 -Phases build,size,startup
 .EXAMPLE
-  # runtime part: concurrency series (6 levels x 3 variants x 10 runs, about 9 h), then the long runs
+  # runtime part: concurrency series (6 levels x 3 variants x 10 runs, about 6 h), then the long runs
   .\experiments\container\measure-images.ps1 -Phases load
   .\experiments\container\measure-images.ps1 -Phases soak
 .EXAMPLE
@@ -66,7 +66,7 @@ param(
     [string] $Label = '',
     [string] $JvmFlags = '-XX:+UseContainerSupport -XX:MaxRAMPercentage=75',
     [int] $MemoryWarmupSeconds = 30,
-    [string] $Cpus = '2',   # CPU limit for startup, load and soak containers ('' = no limit)
+    [string] $Cpus = '4',   # CPU limit for startup, load and soak containers ('' = no limit); 2 starves the JIT
     [ValidateSet('single', 'multi-jdk', 'multi-jre', 'multi-jre-arena2', 'multi')]
     [string[]] $LoadVariants = @('multi-jre', 'multi-jre-arena2', 'multi'),
     [int[]] $LoadLevels = @(10, 25, 50, 100, 200, 400),
