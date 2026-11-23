@@ -5,12 +5,12 @@ on:
   workflow_dispatch:
     inputs:
       study:
-        description: "test = short trial run; study1 = Measurement Study 1"
+        description: "test = short trial run; images = build, size, startup (~6 h); load = concurrency series (~9 h); soak = long runs (~5 h); nmt = Native Memory Tracking runs (~2 h)"
         type: choice
-        options: [test, study1]
+        options: [test, images, load, soak, nmt]
         default: test
       repeats:
-        description: "Runs per variant (study1)"
+        description: "Runs per variant (images: default 5; load: 10 is the study design)"
         type: number
         default: 5
 
@@ -31,12 +31,14 @@ defaults:
 jobs:
   measure:
     runs-on: [self-hosted, thesis-laptop]
-    timeout-minutes: 1440
+    timeout-minutes: 1800
     steps:
       - uses: actions/checkout@v7
 
-      - name: Check preconditions (disk space, no other containers)
+      - name: Check preconditions (power, disk space, no other containers)
         run: |
+          $battery = Get-CimInstance Win32_Battery | Select-Object -First 1
+          if ($battery -and $battery.BatteryStatus -eq 1) { throw 'The laptop is running on battery (CPU throttled) - plug it in' }
           $free = [math]::Round((Get-PSDrive C).Free / 1GB, 1)
           Write-Host "Free disk space on C: $free GB"
           if ($free -lt $env:MIN_FREE_GB) { throw "Only $free GB free, need $env:MIN_FREE_GB GB - run 'docker image prune -a' and 'docker builder prune -a'" }
@@ -71,6 +73,7 @@ jobs:
             "windows:     $($os.Caption) $($os.Version)"
             "cpu:         $($cpu.Name) ($($cpu.NumberOfCores) cores, $($cpu.NumberOfLogicalProcessors) threads)"
             "ram:         $([math]::Round($os.TotalVisibleMemorySize / 1MB, 1)) GB"
+            "power plan:  $(powercfg /getactivescheme)"
             "docker:      $(docker version --format '{{.Server.Platform.Name}}, engine {{.Server.Version}}')"
             "docker vm:   $(docker info --format '{{.NCPU}} CPUs, {{.MemTotal}} bytes memory, kernel {{.KernelVersion}}')"
             "compose:     $(docker compose version --short)"
@@ -86,14 +89,44 @@ jobs:
         if: inputs.study == 'test'
         run: |
           .\experiments\container\measure-images.ps1 -Services report-service -Phases build,size,startup -Repeats 1 -Label test -OutDir results
-          .\experiments\container\measure-images.ps1 -Services esg-score-service -Variants multi -Phases build,load -Repeats 1 -LoadRepeats 1 -LoadDuration 15s -Label test-load -OutDir results
+          .\experiments\container\measure-images.ps1 -Services esg-score-service -Variants multi-jre,multi -Phases build -Repeats 1 -Label prep -OutDir prep
+          .\experiments\container\measure-images.ps1 -Phases load -LoadLevels 10,400 -LoadRepeats 1 -LoadDuration 15s -Label test-load -OutDir results
+          .\experiments\container\measure-images.ps1 -Phases soak -LoadVariants multi -SoakDuration 2m -SoakRepeats 1 -Label test-soak -OutDir results
           if (-not (Get-ChildItem results -Filter 'measurements-*.csv')) { throw 'No measurements were written' }
           exit 0
 
-      - name: Measure (Measurement Study 1)
-        if: inputs.study == 'study1'
+      - name: Measure (Study 1, image part)
+        if: inputs.study == 'images'
         run: |
-          .\experiments\container\measure-images.ps1 -Phases build,size,startup,load -Repeats ${{ inputs.repeats }} -LoadRepeats ${{ inputs.repeats }} -Label study1 -OutDir results
+          .\experiments\container\measure-images.ps1 -Phases build,size,startup -Repeats ${{ inputs.repeats }} -Label images -OutDir results
+          if (-not (Get-ChildItem results -Filter 'measurements-*.csv')) { throw 'No measurements were written' }
+          exit 0
+
+      # load and soak need the two esg-score-service runtime images; their build here is not part of the results
+      - name: Build the load-test images (not measured)
+        if: inputs.study == 'load' || inputs.study == 'soak' || inputs.study == 'nmt'
+        run: |
+          .\experiments\container\measure-images.ps1 -Services esg-score-service -Variants multi-jre,multi -Phases build -Repeats 1 -Label prep -OutDir prep
+          exit 0
+
+      - name: Measure (Study 1, concurrency series)
+        if: inputs.study == 'load'
+        run: |
+          .\experiments\container\measure-images.ps1 -Phases load -LoadRepeats ${{ inputs.repeats }} -Label load -OutDir results
+          if (-not (Get-ChildItem results -Filter 'measurements-*.csv')) { throw 'No measurements were written' }
+          exit 0
+
+      - name: Measure (Study 1, long runs)
+        if: inputs.study == 'soak'
+        run: |
+          .\experiments\container\measure-images.ps1 -Phases soak -Label soak -OutDir results
+          if (-not (Get-ChildItem results -Filter 'measurements-*.csv')) { throw 'No measurements were written' }
+          exit 0
+
+      - name: Measure (Study 1, Native Memory Tracking)
+        if: inputs.study == 'nmt'
+        run: |
+          .\experiments\container\measure-images.ps1 -Phases load -Nmt -LoadLevels 50,200 -LoadRepeats ${{ inputs.repeats }} -Label nmt -OutDir results
           if (-not (Get-ChildItem results -Filter 'measurements-*.csv')) { throw 'No measurements were written' }
           exit 0
 

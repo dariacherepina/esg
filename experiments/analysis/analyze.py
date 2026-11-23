@@ -2,15 +2,16 @@
 """Statistical analysis of the container experiments.
 
 Reads every measurements-*.csv written by experiments/container/measure-images.ps1
-(columns: timestamp, metric, service, variant, run, value, unit) and writes
+(columns: timestamp, metric, service, variant, run, value, unit, level) and writes
 
   report.md   descriptive statistics, normality and significance tests, size/time savings
   stats.csv   the same numbers in machine-readable form
 
-Measurement Study 1, variants single / multi-jdk / multi-jre / multi:
-  repeated metrics  -> Shapiro-Wilk per variant, Kruskal-Wallis across the four variants,
-                       pairwise Mann-Whitney U with Bonferroni correction as post-hoc test
-                       (build/startup time, idle memory, and the load test: throughput, p99, peak memory)
+Measurement Study 1, variants single / multi-jdk / multi-jre / multi (+ multi-jre-arena2 in load and soak):
+  repeated metrics  -> Shapiro-Wilk per variant, Kruskal-Wallis across the variants,
+                       pairwise Mann-Whitney U with Bonferroni correction as post-hoc test, Cliff's delta as effect size
+                       (build/startup time, idle memory; every load_* and soak_* metric per concurrency level)
+  concurrency curve -> medians per level and variant for the main load metrics
   image sizes       -> deterministic (one value per build), reported with % reduction per step
 
 Usage:  python analyze.py <dir with measurements-*.csv> [--out <dir>] [--alpha 0.05]
@@ -26,18 +27,20 @@ import sys
 from scipy import stats
 
 EXP1_VARIANTS = ["single", "multi-jdk", "multi-jre", "multi"]
-EXP1_TESTED = ["build_time", "startup_wall", "startup_ready", "memory_idle",
-               "load_throughput", "load_p99", "load_mem_peak"]
+LOAD_VARIANTS = ["single", "multi-jdk", "multi-jre", "multi-jre-arena2", "multi"]
+EXP1_TESTED = ["build_time", "startup_wall", "startup_ready", "memory_idle", "memory_idle_rss"]
+# the concurrency curve table; every other load_*/soak_* metric is still tested per level
+CURVE = ["load_throughput", "load_p99", "load_cpu_per_request", "load_rss_peak", "load_gc_pause_time"]
+# of the NMT categories only the total and the memory outside it are tested
+NMT_KEEP = ("nmt_total", "nmt_rss_unaccounted")
 EXP1_SIZES = ["size_compressed", "size_uncompressed"]
 
 LABELS = {
     "build_time": "Build time, cold (--no-cache)",
     "startup_wall": "Startup: docker run -> /actuator/health 200",
     "startup_ready": "Startup: JVM-reported application_ready_time",
-    "memory_idle": "Memory at idle (30 s after healthy)",
-    "load_throughput": "Load test: throughput (esg-score-service)",
-    "load_p99": "Load test: p99 latency (esg-score-service)",
-    "load_mem_peak": "Load test: peak memory (esg-score-service)",
+    "memory_idle": "Memory at idle (docker stats, 30 s after healthy)",
+    "memory_idle_rss": "Memory at idle (kernel RSS, 30 s after healthy)",
     "size_compressed": "Image size, compressed (registry)",
     "size_uncompressed": "Image size, uncompressed (layers)",
 }
@@ -56,13 +59,36 @@ def load(directory):
     return files, rows
 
 
+def group_name(service, level):
+    """Load and soak rows are compared per concurrency level, so the level becomes part of the group."""
+    return f"{service} @{level} users" if level else service
+
+
+def level_of(name):
+    return int(name.rsplit("@", 1)[1].split()[0]) if "@" in name else -1
+
+
 def grouped(rows):
-    """{(metric, service, variant): ([values], unit)}"""
+    """{(metric, service[ @level], variant): ([values], unit)}"""
     groups = {}
     for r in rows:
-        key = (r["metric"], r["service"], r["variant"])
+        key = (r["metric"], group_name(r["service"], r.get("level") or ""), r["variant"])
         groups.setdefault(key, ([], r["unit"]))[0].append(r["value"])
     return groups
+
+
+def label(metric):
+    if metric in LABELS:
+        return LABELS[metric]
+    kind, _, rest = metric.partition("_")
+    prefix = {"load": "Load test", "soak": "Long run"}.get(kind, kind)
+    return f"{prefix}: {rest.replace('_', ' ')}"
+
+
+def runtime_metrics(groups):
+    """every load_*/soak_* metric present, NMT reduced to the total and the unaccounted part"""
+    found = sorted({m for (m, _s, _v) in groups if m.startswith(("load_", "soak_"))})
+    return [m for m in found if "_nmt_" not in m or m.endswith(NMT_KEEP)]
 
 
 def describe(values):
@@ -89,6 +115,13 @@ def mann_whitney(a, b):
         return None
     u, p = stats.mannwhitneyu(a, b, alternative="two-sided")
     return u, p
+
+
+def cliffs_delta(a, b):
+    """P(b > a) - P(b < a): -1..1, |d| < 0.147 negligible, < 0.33 small, < 0.474 medium, else large (Romano et al.)"""
+    gt = sum(1 for x in a for y in b if y > x)
+    lt = sum(1 for x in a for y in b if y < x)
+    return (gt - lt) / (len(a) * len(b))
 
 
 def kruskal(samples):
@@ -122,7 +155,7 @@ def table(header, rows):
 
 
 def services_of(groups, metrics):
-    return sorted({s for (m, s, _v) in groups if m in metrics})
+    return sorted({s for (m, s, _v) in groups if m in metrics}, key=lambda s: (s.split(" @")[0], level_of(s)))
 
 
 def analyse_repeated(groups, metric, services, variants, alpha, out_rows, md):
@@ -131,7 +164,7 @@ def analyse_repeated(groups, metric, services, variants, alpha, out_rows, md):
     if not present:
         return
     unit = next(groups[k][1] for k in groups if k[0] == metric)
-    md.append(f"\n### {LABELS.get(metric, metric)} ({unit})\n")
+    md.append(f"\n### {label(metric)} ({unit})\n")
     desc_rows, test_rows = [], []
     for s in present:
         samples = {}
@@ -157,7 +190,8 @@ def analyse_repeated(groups, metric, services, variants, alpha, out_rows, md):
             test_rows.append([s, f"Mann-Whitney U {va} vs {vb}", None if r is None else r[0],
                               pval(None if r is None else r[1]),
                               None if r is None else ("yes" if r[1] < alpha else "no"),
-                              f"median {vb} − {va}: {fmt(diff)} {unit} ({fmt(pct, 1)} %)"])
+                              f"median {vb} − {va}: {fmt(diff)} {unit} ({fmt(pct, 1)} %), "
+                              f"Cliff's δ {fmt(cliffs_delta(a, b))}"])
             out_rows.append({"metric": metric, "service": s, "variant": f"{va} vs {vb}",
                              "test": "mann-whitney", "statistic": None if r is None else r[0],
                              "p": None if r is None else r[1], "unit": unit})
@@ -174,7 +208,8 @@ def analyse_repeated(groups, metric, services, variants, alpha, out_rows, md):
                 r = mann_whitney(samples[va], samples[vb])
                 p_adj = None if r is None else min(1.0, r[1] * len(pairs))
                 test_rows.append([s, f"  post-hoc {va} vs {vb} (Bonferroni)", None if r is None else r[0],
-                                  pval(p_adj), None if r is None else ("yes" if p_adj < alpha else "no"), ""])
+                                  pval(p_adj), None if r is None else ("yes" if p_adj < alpha else "no"),
+                                  f"Cliff's δ {fmt(cliffs_delta(samples[va], samples[vb]))}"])
                 out_rows.append({"metric": metric, "service": s, "variant": f"{va} vs {vb}",
                                  "test": "mann-whitney-bonferroni", "statistic": None if r is None else r[0],
                                  "p": p_adj, "unit": unit})
@@ -208,6 +243,19 @@ def analyse_sizes(groups, services, md, out_rows):
                          "Ubuntu→Alpine: multi-jre→multi %", "total: single→multi %"], rows))
 
 
+def analyse_curve(groups, md):
+    """medians per concurrency level (rows) and variant (columns): where do the images start to differ?"""
+    for metric in CURVE:
+        cells = {(s, v): statistics.median(vals) for (m, s, v), (vals, _u) in groups.items() if m == metric}
+        if not cells:
+            continue
+        unit = next(u for (m, _s, _v), (_vals, u) in groups.items() if m == metric)
+        variants = [v for v in LOAD_VARIANTS if any(k[1] == v for k in cells)]
+        levels = sorted({s for s, _v in cells}, key=level_of)
+        md.append(f"\n#### {label(metric)} ({unit}), median per level\n")
+        md.append(table(["level"] + variants, [[s] + [cells.get((s, v)) for v in variants] for s in levels]))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", help="directory containing measurements-*.csv (searched recursively)")
@@ -221,16 +269,24 @@ def main():
     md = ["# Container experiments — statistical analysis", "",
           f"Input: {len(files)} file(s), {len(rows)} measurements. α = {args.alpha}.",
           "Shapiro-Wilk is reported per variant; the significance tests are non-parametric "
-          "(Kruskal-Wallis / Mann-Whitney U), so they do not assume normality. With n = 5 per "
-          "group the smallest possible two-sided Mann-Whitney p is 0.0079; with 4 variants there are "
-          "6 post-hoc pairs, so the smallest Bonferroni-adjusted p is 0.048."]
+          "(Kruskal-Wallis / Mann-Whitney U), so they do not assume normality. Bonferroni corrects for the "
+          "post-hoc pairs within one metric and level. With n = 5 per group the smallest two-sided Mann-Whitney p "
+          "is 0.0079, with n = 10 it is 1.1e-5. Cliff's δ > 0 means the second variant has higher values."]
 
-    exp1_services = services_of(groups, EXP1_TESTED + EXP1_SIZES)
+    exp1_services = [s for s in services_of(groups, EXP1_TESTED + EXP1_SIZES) if "@" not in s]
     if exp1_services:
         md.append("\n## Measurement Study 1 — image variants (single vs multi-jdk vs multi-jre vs multi)")
         analyse_sizes(groups, exp1_services, md, out_rows)
         for metric in EXP1_TESTED:
             analyse_repeated(groups, metric, exp1_services, EXP1_VARIANTS, args.alpha, out_rows, md)
+
+    runtime = runtime_metrics(groups)
+    if runtime:
+        md.append("\n## Measurement Study 1 — runtime under load (concurrency series and long runs)")
+        analyse_curve(groups, md)
+        runtime_services = services_of(groups, runtime)
+        for metric in runtime:
+            analyse_repeated(groups, metric, runtime_services, LOAD_VARIANTS, args.alpha, out_rows, md)
 
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "report.md"), "w", encoding="utf-8") as f:
