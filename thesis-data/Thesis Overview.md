@@ -51,7 +51,7 @@ Before any measurement runs, Hadolint (v2.15.1, default rules) is executed on ev
 
 **Research Question (RQ1):** How do the four image variants compare in build time, image size, startup time and memory, and how do the Ubuntu and the Alpine JRE image compare under increasing load?
 
-Measurement Study 1 compares the image variants on observable metrics — what a team gains and loses by choosing one image over another — and, for the runtime comparison of the two JRE images, tests explanations for the differences it observes. It has two parts: the image part covers all variants and services, the runtime part concentrates on the two JRE images of one service.
+Measurement Study 1 compares the image variants on observable metrics — what a team gains and loses by choosing one image over another — and, for the runtime comparison of the two JRE images, tests explanations for the differences it observes. The image part (A) covers all variants and services; the runtime parts (B–E) concentrate on the two JRE images of one service.
 
 (Paper Title: Mining and Measuring the Impact of Change Patterns for Improving the Size and Build Time of Docker Images (2025); Implementation and Analysis of Container Image Optimization Using Alpine Linux and Multi-Stage Builds (2025))
 
@@ -63,6 +63,20 @@ Measurement Study 1 compares the image variants on observable metrics — what a
 | Multi-stage + Alpine | eclipse-temurin:21.0.13_9-jre-alpine — Alpine, JRE only |
 
 All variants run with identical JVM flags (`-XX:+UseContainerSupport -XX:MaxRAMPercentage=75`), a 512 MB memory limit and a limit of 2 CPUs. The heap is set to 75% of the memory (384 MB) because Java's default of 25% would be too small for Spring Boot under load, which means the absolute memory values apply only to this setting while the comparison between variants stays fair. With less than 2 GB of memory the JVM selects the Serial garbage collector by itself; this is recorded in the GC log of every run.
+
+**Ergonomics check (done on 2026-11-23):** the JVM chooses the GC, heap size and thread counts automatically from the CPUs and memory it detects. If the images differed there, a GC difference between them would have a trivial cause. Both JRE images were started with the measurement's limits and flags and compared with `java -version`, `-Xlog:gc*` and `-XX:+PrintFlagsFinal`:
+
+| Setting | Ubuntu JRE | Alpine JRE |
+|---|---|---|
+| JVM build | Temurin-21.0.13+9 (21.0.13+9-LTS) | Temurin-21.0.13+9 (21.0.13+9-LTS) |
+| GC | Serial (ergonomic) | Serial (ergonomic) |
+| Maximum / initial heap | 384 MB / 8 MB | 384 MB / 8 MB |
+| CPUs detected (2-CPU limit) | 2 of 16 | 2 of 16 |
+| JIT compiler threads (2 CPUs / no limit) | 2 / 12 | 2 / 12 |
+| GC threads | 1 (Serial) | 1 (Serial) |
+| Compressed oops, thread stack size | enabled, 1 MB | enabled, 1 MB |
+
+The settings are identical, so differences between the images cannot come from JVM ergonomics. Side observation: with 2 CPUs the JVM runs only 2 JIT compiler threads instead of 12, so warm-up takes longer under the CPU limit; this is why the warm-up is 30 s and measured separately.
 
 ### Part A — Image metrics (all variants, all four services)
 
@@ -99,6 +113,16 @@ The runtime part compares the two images that differ only in the distribution an
 | Memory time series (every 2 s) | Docker, `/proc/1/status` | when a memory difference forms (startup, warm-up, under load) |
 | Heap used and committed, non-heap used, peak threads | Micrometer via `/actuator/prometheus` | whether a memory difference lies in the Java heap or outside it |
 | GC pauses: count, total time, p50, p95, maximum | Micrometer and the JVM's GC log (`-Xlog:gc`) | whether GC behaves differently, and whether a difference is systematic or a few outliers |
+| GC normalized: pauses per 1,000 requests, share of time paused (%), allocation rate (MiB/s) and allocation per request (KiB) | Micrometer (`jvm_gc_memory_allocated_bytes_total`) and the k6 request count | a variant that serves fewer requests allocates less and collects less often; per unit of work, a GC difference can be told apart from a throughput difference |
+| Time-to-safepoint: count, p50, p95, maximum (µs) | the JVM's safepoint log (`-Xlog:safepoint`) | how long it takes until all application threads have stopped for a pause; thread scheduling and locking are implemented differently in glibc and musl, so this is where an OS-level difference could lengthen pauses although the GC itself is equally fast |
+
+**How the normalized GC metrics are read:**
+
+| Observation after normalizing | Interpretation |
+|---|---|
+| the GC difference disappears | GC behaviour is a consequence of different throughput; the cause lies elsewhere (allocator, JVM build) |
+| GCs or allocation per request still differ | the Java code or a library allocates differently on the two images; unusual, investigated separately |
+| pause length or time-to-safepoint still differs | something affects how fast the pause itself completes; Part E tests whether this depends on the collector |
 
 **Why a CPU limit of 2:** production containers rarely see all CPUs of a host. The JVM sizes its JIT compiler threads by the CPUs it sees, so the CPU count changes contention and the absolute values. The limit also keeps the service from competing with the load generator (k6 runs on the same machine) for CPU.
 
@@ -115,6 +139,35 @@ The runtime part compares the two images that differ only in the distribution an
 - Unaccounted memory = kernel RSS − NMT total: memory the process holds that the JVM does not account for (libc allocator overhead and retained free memory, shared libraries)
 - If the Ubuntu image holds more memory than the Alpine image while the NMT totals are equal, the difference lies outside the JVM, i.e. in the C library or other system libraries
 - Not part of the main runs, because NMT itself costs memory (about 5 MiB) and some CPU; 5 runs at 50 and 200 users
+
+### Part E — GC experiment (variant × garbage collector)
+
+If a GC difference between the images remains after normalizing (Part B), this part tests whether it depends on the collector. Every variant runs with every collector; the heap limit (384 MB), CPU and memory limits and the load stay the same.
+
+| | Serial | G1 |
+|---|---|---|
+| Ubuntu JRE | | |
+| Alpine JRE | | |
+| Ubuntu JRE + `MALLOC_ARENA_MAX=2` | | |
+
+- Serial: one GC thread, every pause stops the application completely — the simplest case with the fewest side effects, and what the JVM chooses by itself for this container size
+- G1: the JVM's default on larger machines and the realistic production choice; it runs concurrent GC threads next to the application, which compete for the 2 CPUs
+- Parallel and ZGC are supported by the script (`-LoadGcs parallel,zgc`) but not part of the planned runs; ZGC on JDK 21 is only generational with `-XX:+ZGenerational`
+- 50 and 200 users (where the GC difference was largest in the preliminary runs), 10 runs each: 2 levels × 3 variants × 2 GCs × 10 = 120 runs, about 7 hours
+
+| Result | Interpretation |
+|---|---|
+| the difference appears with every GC | the cause lies outside the GC: allocator, JVM build, thread scheduling |
+| the difference appears only with G1 | an interaction: concurrent GC threads compete with the application for the 2 CPUs, so a difference in CPU efficiency shows here first |
+| Ubuntu vs. Alpine differs, Ubuntu + arena2 vs. Alpine does not | points to glibc's allocator |
+
+**Detail runs (`-GcDetail`, 3 runs at 200 users, Serial and G1):** a GC phase log (`-Xlog:gc+phases=debug`) splits each pause into its phases, showing whether one phase differs; a Java Flight Recording (written at JVM exit) records GC, allocation, thread and CPU events for inspection in JDK Mission Control. Both cost some overhead and are not part of the measured runs.
+
+Observation from the trial runs: on the Alpine JRE, Java Flight Recorder's default mode cannot write its recording — the dump at JVM exit fails with `Unable to complete I/O operation when dumping recording` and leaves a 0-byte file, reproducible with a bare `java -XX:StartFlightRecording=dumponexit=true,filename=… -version`, while the same command works on the Ubuntu JRE. Keeping the recording in memory (`disk=false`, 32 MB buffer) works on both; the detail runs use this mode for both images. This is a functional difference of the musl build that matters for operations (diagnostics), independent of performance.
+
+ZGC notes (if used): its pauses are logged in a different format, so the pause percentiles from the GC log are not available, and its allocation counter is not directly comparable with Serial and G1.
+
+**Possible causes of a GC difference** (hypotheses, to be confirmed by the measurements above): different JVM ergonomics or build (ruled out by the ergonomics check); different throughput and therefore allocation rate (checked by the normalized metrics); time-to-safepoint, because glibc and musl implement threads and locking differently (checked by the safepoint log); native GC data structures allocated through libc `malloc` (not measured directly; the arena control gives an indication).
 
 ### Statistics
 
@@ -175,7 +228,7 @@ The cost components have different units (seconds, MB, MiB-hours, CPU-seconds). 
 
 ## Reproducibility & CI/CD
 
-Measurement Study 1 is executed via a GitHub Actions workflow running on a self-hosted runner registered to the thesis repository. The self-hosted runner is the author's laptop (Windows 11 Home, Docker Desktop), used exclusively for the measurements while they run: it runs on mains power, other containers are stopped (the workflow refuses to start otherwise) and no other applications run (including cloud sync clients such as Google Drive). All jobs run sequentially on this machine (`.github/workflows/experiments.yml`, started by hand) as separate workflow runs: `images` (Part A, about 6 hours), `load` (Part B, about 9 hours) and `soak` (Part C, about 5 hours); `test` is a short trial run of all phases. Part D runs with the `-Nmt` switch of the measurement script. Each run records the host environment (Windows, CPU, RAM, Docker, tool versions) in `environment.txt` next to the measurements. The build cache is pruned automatically after every timed build, because the laptop has limited disk space. Limitations of this setup: Docker Desktop runs the containers in a WSL2 Linux VM (16 CPUs, 7.6 GiB memory) rather than natively, the hardware is a consumer laptop, and dependencies are downloaded over a home network connection. An Azure VM was evaluated first but could not be provisioned within the student subscription (`VM.md`).
+Measurement Study 1 is executed via a GitHub Actions workflow running on a self-hosted runner registered to the thesis repository. The self-hosted runner is the author's laptop (Windows 11 Home, Docker Desktop), used exclusively for the measurements while they run: it runs on mains power, other containers are stopped (the workflow refuses to start otherwise) and no other applications run (including cloud sync clients such as Google Drive). All jobs run sequentially on this machine (`.github/workflows/experiments.yml`, started by hand) as separate workflow runs: `images` (Part A, about 6 hours), `load` (Part B, about 9 hours) and `soak` (Part C, about 5 hours), `nmt` (Part D, about 2 hours), `gc` (Part E, about 7 hours) and `gcdetail` (Part E detail runs, about 1 hour); `test` is a short trial run of all phases. Each run records the host environment (Windows, CPU, RAM, Docker, tool versions) in `environment.txt` next to the measurements. The build cache is pruned automatically after every timed build, because the laptop has limited disk space. Limitations of this setup: Docker Desktop runs the containers in a WSL2 Linux VM (16 CPUs, 7.6 GiB memory) rather than natively, the hardware is a consumer laptop, and dependencies are downloaded over a home network connection. An Azure VM was evaluated first but could not be provisioned within the student subscription (`VM.md`).
 
 **Infrastructure:**
 

@@ -26,7 +26,11 @@
              Records throughput, p99, CPU time per request, peak memory (docker stats and kernel RSS),
              JVM heap/threads and GC pauses (GC log); memory every 2 s goes to timeseries-*.csv.
              multi-jre-arena2 = the multi-jre image with MALLOC_ARENA_MAX=2 (glibc limited to 2 malloc arenas).
+             GC metrics are also normalized (per 1000 requests, share of time paused, allocation per request),
+             and the GC log includes safepoints (time until all threads stopped).
+             -LoadGcs serial,g1 (also parallel, zgc) adds the GC as a factor: every variant runs with every GC.
              -Nmt adds Native Memory Tracking (explanation runs only, it costs memory itself).
+             -GcDetail adds a GC phase log and a Java Flight Recording per run (explanation runs only).
     soak     long run (-SoakDuration at -SoakLevel), same measurements plus the RSS trend (MiB per 10 min).
 
   Repeats are interleaved (run 1 of every image, then run 2, ...) so that network or machine
@@ -66,6 +70,9 @@ param(
     [ValidateSet('single', 'multi-jdk', 'multi-jre', 'multi-jre-arena2', 'multi')]
     [string[]] $LoadVariants = @('multi-jre', 'multi-jre-arena2', 'multi'),
     [int[]] $LoadLevels = @(10, 25, 50, 100, 200, 400),
+    # GC per load run: default = the JVM's own choice (Serial at 512 MB); several values make a variant x GC design
+    [ValidateSet('default', 'serial', 'parallel', 'g1', 'zgc')]
+    [string[]] $LoadGcs = @('default'),
     [int] $LoadRepeats = 10,
     [string] $LoadDuration = '60s',
     [string] $LoadWarmup = '30s',
@@ -74,6 +81,7 @@ param(
     [string] $SoakDuration = '30m',
     [int] $SoakRepeats = 3,
     [switch] $Nmt,   # Native Memory Tracking in load/soak; costs memory itself, so not for the main runs
+    [switch] $GcDetail,   # load/soak: GC phase log and a Java Flight Recording per run (explanation runs only)
     [string] $K6 = (Join-Path $PSScriptRoot 'tools\k6.exe'),
     [string] $Registry = 'ghcr.io/dariacherepina',
     [string] $OutDir = (Join-Path $PSScriptRoot 'results')
@@ -127,7 +135,7 @@ $scriptStart = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')   #
 # The label keeps parallel CI jobs (one per service) from writing to the same file name.
 $prefix = if ($Label) { "$Label-$stamp" } else { $stamp }
 $csv = Join-Path $OutDir "measurements-$prefix.csv"
-[IO.File]::WriteAllText($csv, "timestamp,metric,service,variant,run,value,unit,level`r`n", $utf8)
+[IO.File]::WriteAllText($csv, "timestamp,metric,service,variant,run,value,unit,level,gc`r`n", $utf8)
 $seriesCsv = Join-Path $OutDir "timeseries-$prefix.csv"   # memory every 2 s during load and soak runs
 $logDir = Join-Path $OutDir "logs-$prefix"   # full container log of every startup, load and soak run
 
@@ -143,10 +151,11 @@ function Save-ContainerLog($c, $name) {
 function LocalTag($s, $v)  { "${s}:$v" }
 function RemoteTag($s, $v) { "$Registry/${s}:$v" }
 
-function Write-Result($metric, $s, $v, $run, [double] $value, $unit, $level = '') {
-    $line = '{0},{1},{2},{3},{4},{5},{6},{7}' -f (Get-Date -Format 's'), $metric, $s, $v, $run, $value.ToString('0.###', $inv), $unit, $level
+function Write-Result($metric, $s, $v, $run, [double] $value, $unit, $level = '', $gc = '') {
+    $line = '{0},{1},{2},{3},{4},{5},{6},{7},{8}' -f (Get-Date -Format 's'), $metric, $s, $v, $run, $value.ToString('0.###', $inv), $unit, $level, $gc
     [IO.File]::AppendAllText($csv, "$line`r`n", $utf8)
     $at = if ($level) { " @$level" } else { '' }
+    if ($gc) { $at += " $gc" }
     Write-Host ('  {0,-22} {1,-18} {2,-16} run {3}: {4} {5}' -f $metric, $s, "$v$at", $run, $value.ToString('0.##', $inv), $unit)
 }
 
@@ -217,6 +226,7 @@ function Get-JvmMetrics($baseUrl) {
         HeapCommitted = & $sum 'jvm_memory_committed_bytes' 'area="heap"'
         NonHeapUsed   = & $sum 'jvm_memory_used_bytes' 'area="nonheap"'
         ThreadsPeak   = & $sum 'jvm_threads_peak_threads' $null
+        Allocated     = & $sum 'jvm_gc_memory_allocated_bytes_total' $null   # bytes allocated in the young generation
         Uptime        = & $sum 'process_uptime_seconds' $null   # same clock as the GC log's uptime decorator
     }
 }
@@ -236,17 +246,22 @@ function Get-Percentile($sorted, $p) {
     return $sorted[$lo] + ($sorted[$hi] - $sorted[$lo]) * ($i - $lo)
 }
 
-function Read-GcPauses($path, $from, $to) {
-    # Unified GC log lines like "[12.345s] GC(3) Pause Young (Allocation Failure) 120M->30M(300M) 4.567ms"
+function Read-GcLog($path, $from, $to) {
+    # GC pauses ("[12.3s] GC(3) Pause Young (Allocation Failure) 120M->30M(300M) 4.567ms") and safepoints
+    # ("[12.3s] Safepoint "...", ..., Reaching safepoint: 3768 ns, ...") between JVM uptime $from and $to
     $pauses = New-Object 'System.Collections.Generic.List[double]'
+    $reach = New-Object 'System.Collections.Generic.List[double]'
     foreach ($l in [IO.File]::ReadAllLines($path)) {
-        if ($l -match '^\[([\d.]+)s\].* Pause .* ([\d.]+)ms$') {
+        if ($l -match '^\[([\d.]+)s\] GC\(\d+\) Pause .* ([\d.]+)ms$') {
             $t = [double]::Parse($Matches[1], $inv)
             if ($t -ge $from -and $t -le $to) { $pauses.Add([double]::Parse($Matches[2], $inv)) }
+        } elseif ($l -match '^\[([\d.]+)s\] Safepoint .*Reaching safepoint: (\d+) ns') {
+            $t = [double]::Parse($Matches[1], $inv)
+            if ($t -ge $from -and $t -le $to) { $reach.Add([double] $Matches[2] / 1000) }   # time-to-safepoint in µs
         }
     }
-    $pauses.Sort()
-    return , $pauses
+    $pauses.Sort(); $reach.Sort()
+    return [pscustomobject] @{ Pauses = $pauses; TimeToSafepoint = $reach }
 }
 
 function Read-NmtSummary($lines) {
@@ -392,21 +407,23 @@ function Write-Series($kind, $v, $level, $run, $samples) {
     if ($lines) { [IO.File]::AppendAllText($seriesCsv, (($lines -join "`r`n") + "`r`n"), $utf8) }
 }
 
-function Invoke-LoadRun($kind, $v, $level, $duration, $run) {
+function Invoke-LoadRun($kind, $v, $level, $duration, $run, $gc = 'default') {
     # one k6 run against a fresh esg-score-service container; $kind ('load' or 'soak') prefixes the metric names
     $s = 'esg-score-service'
     $imageVariant = if ($v -eq 'multi-jre-arena2') { 'multi-jre' } else { $v }
     $img = RemoteTag $s $imageVariant
     if (-not (Test-Image $img)) { $img = LocalTag $s $imageVariant }
     if (-not (Test-Image $img)) { Write-Warning "no image for $s $imageVariant - run the build phase first"; return }
-    $emit = { param($metric, $value, $unit) Write-Result "${kind}_$metric" $s $v $run $value $unit $level }
+    $gcLabel = if ($gc -eq 'default') { '' } else { $gc }   # empty = the JVM's own choice, as in the main runs
+    $emit = { param($metric, $value, $unit) Write-Result "${kind}_$metric" $s $v $run $value $unit $level $gcLabel }
     $measureSeconds = ConvertFrom-K6Duration $duration
-    $tag = "$kind-$v-c$level-run$run"
+    $tag = if ($gcLabel) { "$kind-$v-$gcLabel-c$level-run$run" } else { "$kind-$v-c$level-run$run" }
+    $flags = "$loadFlags $($gcFlags[$gc])".Trim()
 
     docker rm -f $container 2>$null | Out-Null
     $runArgs = @('run', '-d', '--name', $container, '--network', $network, '--memory', '512m') + (Get-CpuArgs) + @('-p', "${loadPort}:$($port[$s])")
     foreach ($e in $containerEnv[$s]) { $runArgs += @('-e', $e) }
-    $runArgs += @('-e', "JAVA_TOOL_OPTIONS=$loadFlags", '-e', 'JAVA_OPTS=')   # startup phase flags plus logging
+    $runArgs += @('-e', "JAVA_TOOL_OPTIONS=$flags", '-e', 'JAVA_OPTS=')   # startup phase flags plus logging and GC
     if ($v -eq 'multi-jre-arena2') { $runArgs += @('-e', 'MALLOC_ARENA_MAX=2') }   # read by glibc at process start
     docker @runArgs $img | Out-Null
 
@@ -460,15 +477,20 @@ function Invoke-LoadRun($kind, $v, $level, $duration, $run) {
         $proc = Get-ProcMemory $container
 
         # the JRE images have no jcmd, so NMT prints its summary at JVM exit: stop gracefully, read the log
+        # the flight recording is also written at JVM exit, so -GcDetail stops the container gracefully too
+        if ($Nmt -or $GcDetail) { docker stop -t 60 $container 2>$null | Out-Null }
         $nmtSummary = $null
         if ($Nmt) {
-            docker stop -t 60 $container 2>$null | Out-Null
             $log = docker logs $container 2>&1 | ForEach-Object { "$_" }
             [IO.File]::WriteAllLines((Join-Path $diagDir "nmt-$tag.txt"), [string[]] $log, $utf8)
             $nmtSummary = Read-NmtSummary $log
         }
         $gcFile = Join-Path $diagDir "gc-$tag.log"
         docker cp "${container}:/tmp/gc.log" $gcFile 2>$null | Out-Null
+        if ($GcDetail) {
+            docker cp "${container}:/tmp/gc-phases.log" (Join-Path $diagDir "gc-phases-$tag.log") 2>$null | Out-Null
+            docker cp "${container}:/tmp/recording.jfr" (Join-Path $diagDir "recording-$tag.jfr") 2>$null | Out-Null
+        }
 
         Stop-Job $memJob
         $samples = @(Receive-Job $memJob | ForEach-Object {
@@ -501,18 +523,37 @@ function Invoke-LoadRun($kind, $v, $level, $duration, $run) {
             if ($null -ne $slope) { & $emit 'rss_trend' ($slope * 600) 'MiB/10min' }
         }
         if ($jvmBefore -and $jvmAfter) {
-            & $emit 'gc_pauses' ($jvmAfter.GcCount - $jvmBefore.GcCount) 'count'
-            & $emit 'gc_pause_time' (1000 * ($jvmAfter.GcSeconds - $jvmBefore.GcSeconds)) 'ms'
+            $gcCount = $jvmAfter.GcCount - $jvmBefore.GcCount
+            $gcMs = 1000 * ($jvmAfter.GcSeconds - $jvmBefore.GcSeconds)
+            $window = $jvmAfter.Uptime - $jvmBefore.Uptime   # JVM uptime between the two snapshots, in s
+            & $emit 'gc_pauses' $gcCount 'count'
+            & $emit 'gc_pause_time' $gcMs 'ms'
+            # per unit of work: a variant that serves fewer requests allocates less and collects less often
+            if ($res.Requests -gt 0) { & $emit 'gc_per_1k_requests' (1000 * $gcCount / $res.Requests) 'count' }
+            if ($window -gt 0) {
+                & $emit 'gc_pause_share' (100 * $gcMs / 1000 / $window) '%'   # share of the time the application was stopped
+                & $emit 'alloc_rate' (($jvmAfter.Allocated - $jvmBefore.Allocated) / 1MB / $window) 'MiB/s'
+            }
+            if ($res.Requests -gt 0) { & $emit 'alloc_per_request' (($jvmAfter.Allocated - $jvmBefore.Allocated) / 1KB / $res.Requests) 'KiB' }
             & $emit 'heap_used' ($jvmAfter.HeapUsed / 1MB) 'MiB'
             & $emit 'heap_committed' ($jvmAfter.HeapCommitted / 1MB) 'MiB'
             & $emit 'nonheap_used' ($jvmAfter.NonHeapUsed / 1MB) 'MiB'
             & $emit 'threads_peak' $jvmAfter.ThreadsPeak 'count'
             if (Test-Path $gcFile) {
-                $pauses = Read-GcPauses $gcFile $jvmBefore.Uptime $jvmAfter.Uptime
+                $gcLog = Read-GcLog $gcFile $jvmBefore.Uptime $jvmAfter.Uptime
+                $pauses = $gcLog.Pauses
                 if ($pauses.Count -gt 0) {
                     & $emit 'gc_pause_p50' (Get-Percentile $pauses 0.5) 'ms'
                     & $emit 'gc_pause_p95' (Get-Percentile $pauses 0.95) 'ms'
                     & $emit 'gc_pause_max' $pauses[$pauses.Count - 1] 'ms'
+                }
+                # time-to-safepoint: how long until all application threads have stopped for a pause
+                $ttsp = $gcLog.TimeToSafepoint
+                if ($ttsp.Count -gt 0) {
+                    & $emit 'safepoints' $ttsp.Count 'count'
+                    & $emit 'ttsp_p50' (Get-Percentile $ttsp 0.5) 'us'
+                    & $emit 'ttsp_p95' (Get-Percentile $ttsp 0.95) 'us'
+                    & $emit 'ttsp_max' $ttsp[$ttsp.Count - 1] 'us'
                 }
             }
         }
@@ -628,24 +669,34 @@ try {
             $loadPort = 10000 + $port['esg-score-service']   # 18082, same as in Measure-Startup
             $loadBase = "http://localhost:$loadPort"
             # GC log (gc+init also logs the collector and the CPUs the JVM sees); NMT only on request
-            $loadFlags = "$JvmFlags -Xlog:gc,gc+init:file=/tmp/gc.log:uptime"
+            $loadFlags = "$JvmFlags -Xlog:gc,gc+init,safepoint:file=/tmp/gc.log:uptime"
             if ($Nmt) { $loadFlags += ' -XX:NativeMemoryTracking=summary -XX:+UnlockDiagnosticVMOptions -XX:+PrintNMTStatistics' }
+            if ($GcDetail) {
+                # pause phases in a separate file; flight recording (GC, allocation, threads, CPU) written at JVM exit
+                $loadFlags += ' -Xlog:gc+phases=debug:file=/tmp/gc-phases.log:uptime'
+                # disk=false: on the musl JRE the exit dump from JFR's disk repository fails (0-byte file); same mode on both images
+                $loadFlags += ' -XX:FlightRecorderOptions=memorysize=32m -XX:StartFlightRecording=disk=false,dumponexit=true,filename=/tmp/recording.jfr'
+            }
+            # ZGC is generational only with -XX:+ZGenerational on JDK 21; the heap limit stays the same for every GC
+            $gcFlags = @{ 'default' = ''; 'serial' = '-XX:+UseSerialGC'; 'parallel' = '-XX:+UseParallelGC'
+                          'g1' = '-XX:+UseG1GC'; 'zgc' = '-XX:+UseZGC -XX:+ZGenerational' }
             $diagDir = Join-Path $OutDir "diagnostics-$prefix"
             New-Item -ItemType Directory -Force $diagDir | Out-Null
             $rng = New-Object Random $Seed
             $cpuText = if ($Cpus) { "$Cpus CPUs" } else { 'no CPU limit' }
 
             if ($Phases -contains 'load') {
-                $cells = @(foreach ($l in $LoadLevels) { foreach ($v in $LoadVariants) { [pscustomobject] @{ Level = $l; Variant = $v } } })
-                Write-Host ("== load: {0} users x {1} x {2} runs, {3} each after {4} warm-up, {5}, random order (seed {6})" -f `
-                    ($LoadLevels -join '/'), ($LoadVariants -join ', '), $LoadRepeats, $LoadDuration, $LoadWarmup, $cpuText, $Seed)
+                $cells = @(foreach ($l in $LoadLevels) { foreach ($v in $LoadVariants) { foreach ($g in $LoadGcs) {
+                    [pscustomobject] @{ Level = $l; Variant = $v; Gc = $g } } } })
+                Write-Host ("== load: {0} users x {1} x GC {2} x {3} runs, {4} each after {5} warm-up, {6}, random order (seed {7})" -f `
+                    ($LoadLevels -join '/'), ($LoadVariants -join ', '), ($LoadGcs -join '/'), $LoadRepeats, $LoadDuration, $LoadWarmup, $cpuText, $Seed)
                 for ($r = 1; $r -le $LoadRepeats; $r++) {
                     # every repeat runs all level x variant cells once, in a new random order
                     $i = 0
                     foreach ($c in (Get-Shuffled $cells $rng)) {
                         $i++
-                        Write-Host "-- $(Get-Date -Format T) run $r/$LoadRepeats, $i/$($cells.Count): $($c.Variant) @ $($c.Level) users"
-                        Invoke-LoadRun 'load' $c.Variant $c.Level $LoadDuration $r
+                        Write-Host "-- $(Get-Date -Format T) run $r/$LoadRepeats, $i/$($cells.Count): $($c.Variant) @ $($c.Level) users, GC $($c.Gc)"
+                        Invoke-LoadRun 'load' $c.Variant $c.Level $LoadDuration $r $c.Gc
                     }
                 }
             }
@@ -678,7 +729,7 @@ $rows = @(Import-Csv $csv)
 if ($rows.Count -eq 0) { Write-Host 'No measurements recorded.'; return }
 
 $fmt = { param($x) ([double] $x).ToString('0.##', $inv) }
-$summary = $rows | Group-Object metric, service, variant, level | ForEach-Object {
+$summary = $rows | Group-Object metric, service, variant, level, gc | ForEach-Object {
     $first = $_.Group[0]
     $vals = @($_.Group | ForEach-Object { [double]::Parse($_.value, $inv) })
     $stats = $vals | Measure-Object -Average -Minimum -Maximum
@@ -688,7 +739,7 @@ $summary = $rows | Group-Object metric, service, variant, level | ForEach-Object
         $sd = [math]::Sqrt($sq / ($vals.Count - 1))
     }
     [pscustomobject] @{
-        metric = $first.metric; service = $first.service; variant = $first.variant; level = $first.level; n = $vals.Count
+        metric = $first.metric; service = $first.service; variant = $first.variant; level = $first.level; gc = $first.gc; n = $vals.Count
         mean = & $fmt $stats.Average; sd = & $fmt $sd; min = & $fmt $stats.Minimum; max = & $fmt $stats.Maximum
         unit = $first.unit
     }

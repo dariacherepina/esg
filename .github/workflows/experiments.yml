@@ -5,9 +5,9 @@ on:
   workflow_dispatch:
     inputs:
       study:
-        description: "test = short trial run; images = build, size, startup (~6 h); load = concurrency series (~9 h); soak = long runs (~5 h); nmt = Native Memory Tracking runs (~2 h)"
+        description: "test = short trial run; images = build, size, startup (~6 h); load = concurrency series (~9 h); soak = long runs (~5 h); nmt = Native Memory Tracking runs (~2 h); gc = variant x GC at 50/200 users (~7 h); gcdetail = GC phases + flight recordings (~1 h)"
         type: choice
-        options: [test, images, load, soak, nmt]
+        options: [test, images, load, soak, nmt, gc, gcdetail]
         default: test
       repeats:
         description: "Runs per variant (images: default 5; load: 10 is the study design)"
@@ -104,7 +104,7 @@ jobs:
 
       # load and soak need the two esg-score-service runtime images; their build here is not part of the results
       - name: Build the load-test images (not measured)
-        if: inputs.study == 'load' || inputs.study == 'soak' || inputs.study == 'nmt'
+        if: inputs.study != 'test' && inputs.study != 'images'
         run: |
           .\experiments\container\measure-images.ps1 -Services esg-score-service -Variants multi-jre,multi -Phases build -Repeats 1 -Label prep -OutDir prep
           exit 0
@@ -127,6 +127,21 @@ jobs:
         if: inputs.study == 'nmt'
         run: |
           .\experiments\container\measure-images.ps1 -Phases load -Nmt -LoadLevels 50,200 -LoadRepeats ${{ inputs.repeats }} -Label nmt -OutDir results
+          if (-not (Get-ChildItem results -Filter 'measurements-*.csv')) { throw 'No measurements were written' }
+          exit 0
+
+      # GC experiment: every variant with Serial and G1, at the two levels where the GC difference was largest
+      - name: Measure (Study 1, variant x GC)
+        if: inputs.study == 'gc'
+        run: |
+          .\experiments\container\measure-images.ps1 -Phases load -LoadGcs serial,g1 -LoadLevels 50,200 -LoadRepeats ${{ inputs.repeats }} -Label gc -OutDir results
+          if (-not (Get-ChildItem results -Filter 'measurements-*.csv')) { throw 'No measurements were written' }
+          exit 0
+
+      - name: Measure (Study 1, GC detail)
+        if: inputs.study == 'gcdetail'
+        run: |
+          .\experiments\container\measure-images.ps1 -Phases load -GcDetail -LoadGcs serial,g1 -LoadLevels 200 -LoadRepeats ${{ inputs.repeats }} -Label gcdetail -OutDir results
           if (-not (Get-ChildItem results -Filter 'measurements-*.csv')) { throw 'No measurements were written' }
           exit 0
 

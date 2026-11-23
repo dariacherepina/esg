@@ -30,7 +30,8 @@ EXP1_VARIANTS = ["single", "multi-jdk", "multi-jre", "multi"]
 LOAD_VARIANTS = ["single", "multi-jdk", "multi-jre", "multi-jre-arena2", "multi"]
 EXP1_TESTED = ["build_time", "startup_wall", "startup_ready", "memory_idle", "memory_idle_rss"]
 # the concurrency curve table; every other load_*/soak_* metric is still tested per level
-CURVE = ["load_throughput", "load_p99", "load_cpu_per_request", "load_rss_peak", "load_gc_pause_time"]
+CURVE = ["load_throughput", "load_p99", "load_cpu_per_request", "load_rss_peak", "load_gc_pause_share",
+         "load_gc_per_1k_requests", "load_alloc_per_request", "load_ttsp_p95"]
 # of the NMT categories only the total and the memory outside it are tested
 NMT_KEEP = ("nmt_total", "nmt_rss_unaccounted")
 EXP1_SIZES = ["size_compressed", "size_uncompressed"]
@@ -59,20 +60,26 @@ def load(directory):
     return files, rows
 
 
-def group_name(service, level):
-    """Load and soak rows are compared per concurrency level, so the level becomes part of the group."""
-    return f"{service} @{level} users" if level else service
+def group_name(service, level, gc=""):
+    """Load and soak rows are compared per concurrency level (and GC, if one was set), so both become part of the group."""
+    name = f"{service} @{level} users" if level else service
+    return f"{name}, GC {gc}" if gc else name
 
 
 def level_of(name):
     return int(name.rsplit("@", 1)[1].split()[0]) if "@" in name else -1
 
 
+def sort_key(name):
+    """service, then concurrency level, then GC"""
+    return name.split(" @")[0], level_of(name), name.split(", GC ")[1] if ", GC " in name else ""
+
+
 def grouped(rows):
     """{(metric, service[ @level], variant): ([values], unit)}"""
     groups = {}
     for r in rows:
-        key = (r["metric"], group_name(r["service"], r.get("level") or ""), r["variant"])
+        key = (r["metric"], group_name(r["service"], r.get("level") or "", r.get("gc") or ""), r["variant"])
         groups.setdefault(key, ([], r["unit"]))[0].append(r["value"])
     return groups
 
@@ -155,7 +162,7 @@ def table(header, rows):
 
 
 def services_of(groups, metrics):
-    return sorted({s for (m, s, _v) in groups if m in metrics}, key=lambda s: (s.split(" @")[0], level_of(s)))
+    return sorted({s for (m, s, _v) in groups if m in metrics}, key=sort_key)
 
 
 def analyse_repeated(groups, metric, services, variants, alpha, out_rows, md):
@@ -251,7 +258,7 @@ def analyse_curve(groups, md):
             continue
         unit = next(u for (m, _s, _v), (_vals, u) in groups.items() if m == metric)
         variants = [v for v in LOAD_VARIANTS if any(k[1] == v for k in cells)]
-        levels = sorted({s for s, _v in cells}, key=level_of)
+        levels = sorted({s for s, _v in cells}, key=sort_key)
         md.append(f"\n#### {label(metric)} ({unit}), median per level\n")
         md.append(table(["level"] + variants, [[s] + [cells.get((s, v)) for v in variants] for s in levels]))
 
