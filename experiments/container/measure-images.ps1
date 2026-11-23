@@ -123,11 +123,22 @@ if ($battery -and $battery.BatteryStatus -eq 1) { Write-Warning 'The laptop is r
 
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$scriptStart = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')   # infrastructure logs from here on
 # The label keeps parallel CI jobs (one per service) from writing to the same file name.
 $prefix = if ($Label) { "$Label-$stamp" } else { $stamp }
 $csv = Join-Path $OutDir "measurements-$prefix.csv"
 [IO.File]::WriteAllText($csv, "timestamp,metric,service,variant,run,value,unit,level`r`n", $utf8)
 $seriesCsv = Join-Path $OutDir "timeseries-$prefix.csv"   # memory every 2 s during load and soak runs
+$logDir = Join-Path $OutDir "logs-$prefix"   # full container log of every startup, load and soak run
+
+function Save-ContainerLog($c, $name) {
+    # container state (exit code, OOM kill by the kernel) plus everything the container wrote, before it is deleted
+    New-Item -ItemType Directory -Force $logDir | Out-Null
+    $state = "$(docker inspect $c --format 'status={{.State.Status}} exit={{.State.ExitCode}} oom_killed={{.State.OOMKilled}} started={{.State.StartedAt}}' 2>$null)"
+    if ($state -match 'oom_killed=true') { Write-Warning "$name was killed by the kernel for exceeding its memory limit" }
+    $log = @("# $name", "# $state") + @(docker logs $c 2>&1 | ForEach-Object { "$_" })
+    [IO.File]::WriteAllLines((Join-Path $logDir "$name.log"), [string[]] $log, $utf8)
+}
 
 function LocalTag($s, $v)  { "${s}:$v" }
 function RemoteTag($s, $v) { "$Registry/${s}:$v" }
@@ -287,6 +298,7 @@ function Measure-Startup($s, $v, $run, [bool] $record) {
     $img = RemoteTag $s $v
     if (-not (Test-Image $img)) { docker pull -q $img | Out-Null }
     docker rm -f $container 2>$null | Out-Null
+    $logName = if ($record) { "startup-$s-$v-run$run" } else { "startup-$s-$v-warmup" }
 
     $hostPort = 10000 + $port[$s]
     $runArgs = @('run', '-d', '--name', $container, '--network', $network, '--memory', '512m') + (Get-CpuArgs) + @('-p', "${hostPort}:$($port[$s])")
@@ -309,6 +321,7 @@ function Measure-Startup($s, $v, $run, [bool] $record) {
     if (-not $up) {
         Write-Warning "$s $v did not become healthy within 180 s, last log lines:"
         docker logs --tail 20 $container
+        Save-ContainerLog $container $logName
         docker rm -f $container | Out-Null
         return
     }
@@ -322,6 +335,7 @@ function Measure-Startup($s, $v, $run, [bool] $record) {
         $memMiB = ConvertTo-MiB (docker stats $container --no-stream --format '{{.MemUsage}}')
         $proc = Get-ProcMemory $container   # cgroup usage (docker stats) also counts page cache, RSS only the process
     }
+    Save-ContainerLog $container $logName
     docker rm -f $container | Out-Null
 
     if ($record) {
@@ -509,6 +523,7 @@ function Invoke-LoadRun($kind, $v, $level, $duration, $run) {
         }
     } finally {
         if ($memJob) { Stop-Job $memJob; Remove-Job $memJob -Force }
+        Save-ContainerLog $container $tag
         docker rm -f $container 2>$null | Out-Null
         Remove-Item $summaryFile -ErrorAction SilentlyContinue
     }
@@ -647,6 +662,14 @@ try {
         }
     }
 } finally {
+    # logs of the shared containers (database, broker, company-service) for the time of this script run
+    foreach ($c in 'esg-postgres', 'esg-rabbitmq', 'esg-company-service') {
+        if (docker ps -aq -f "name=^$c$") {
+            New-Item -ItemType Directory -Force $logDir | Out-Null
+            $log = docker logs --timestamps --since $scriptStart $c 2>&1 | ForEach-Object { "$_" }
+            [IO.File]::WriteAllLines((Join-Path $logDir "infrastructure-$c.log"), [string[]] @($log), $utf8)
+        }
+    }
     Pop-Location
 }
 
