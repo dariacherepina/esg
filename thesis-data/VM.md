@@ -1,6 +1,6 @@
 # VM
 
-Measurement machine for Measurement Study 1 and Experiment 2 (self-hosted GitHub Actions runner).
+Measurement machine for Measurement Study 1 (self-hosted GitHub Actions runner).
 
 ## SSH key
 

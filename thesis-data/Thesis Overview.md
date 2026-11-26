@@ -45,7 +45,7 @@ Before any measurement runs, Hadolint (v2.15.1, default rules) is executed on ev
 - Findings documented before the measurements begin (`thesis-data/hadolint/`):
   - DL3066 (non-numeric user ID): fixed — all multi-stage variants run as user 10001
 - Limitation: Hadolint reports no finding for the single-stage Dockerfile although it runs as root, because only an explicit `USER root` is flagged
-- The reports in `thesis-data/hadolint/` were created when the repository still contained the build-caching Dockerfiles; they are regenerated before the final measurements.
+- `report-before.txt` is the original state (2026-11-19) and still lists the build-caching Dockerfiles that were part of the study at that time; `report-after.txt` was regenerated on 2026-11-26 for the 10 remaining Dockerfiles (8 service variants, the self-built Maven image, the frontend): no findings.
 
 ## Measurement Study 1 — Image Variants
 

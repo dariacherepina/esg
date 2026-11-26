@@ -14,13 +14,12 @@ Container images are pinned by digest in the repository, so the image contents a
 
 | Variant | Build stage | Runtime image |
 |---|---|---|
-| single | – | `maven:3.9.16-eclipse-temurin-21` |
+| single | – | `esg-maven:3.9.16-temurin-21.0.13` (built locally: `eclipse-temurin:21.0.13_9-jdk` + Maven 3.9.16; Ubuntu 26.04.1, Temurin 21.0.13) |
 | multi-jdk | `maven:3.9.16-eclipse-temurin-21` | `eclipse-temurin:21.0.13_9-jdk` |
 | multi-jre | `maven:3.9.16-eclipse-temurin-21` | `eclipse-temurin:21.0.13_9-jre` |
 | multi (Alpine) | `maven:3.9.16-eclipse-temurin-21` | `eclipse-temurin:21.0.13_9-jre-alpine` |
-| cache-right / cache-wrong | `maven:3.9.16-eclipse-temurin-21` | `eclipse-temurin:21.0.13_9-jre-alpine` |
 
-Note: the single-stage variant runs on **Java 21.0.12.1 / Ubuntu 24.04**, the multi-stage variants on **Java 21.0.13 / Ubuntu 26.04 or Alpine**. This is inherent to the official images (the Maven image ships its own JDK) and must be named as a limitation when comparing single with the multi-stage variants.
+Note: the official Maven image runs on Java 21.0.12.1 / Ubuntu 24.04. It is only used to compile the JAR in the build stage of the multi-stage variants. The single-stage variant runs on a self-built image with Maven 3.9.16 (archive SHA-512 `831a8591…358b6f6`) on `eclipse-temurin:21.0.13_9-jdk`, so single and multi-jdk share Ubuntu 26.04.1 and Temurin 21.0.13.
 
 ## Application
 
